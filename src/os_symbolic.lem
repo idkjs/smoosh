@@ -1,0 +1,865 @@
+open import Smoosh_prelude
+open import Os
+
+(**********************************************************************)
+(* SYMBOLIC FS STATE **************************************************)
+(**********************************************************************)
+
+(* Broadly, directories map to contents, which are dir trees or files.
+ * For now, fine, just using for pathname expansion.
+ * TODO: Ultimately, rely on SibylFS's detailed model *)
+
+type symbolic_fs = <|
+  parent: maybe symbolic_fs;
+  contents: Map.map string (file symbolic_fs)
+|>
+
+type fs = symbolic_fs (* shim *)
+
+let symbolic_fs_dotdot fs =
+  match fs.parent with
+  | Nothing -> fs
+  | Just fs' -> fs'
+  end
+
+let symbolic_fs_subdir fs name = 
+  match Map.lookup name fs.contents with
+  | Just (Dir fs) -> Just fs
+  | _ -> Nothing
+  end
+
+val symbolic_fs_resolve_comps : symbolic_fs -> list string -> maybe (file symbolic_fs)
+let rec symbolic_fs_resolve_comps fs comps =
+  match comps with
+  | [] -> Just (Dir fs)
+  | ""::comps' -> symbolic_fs_resolve_comps fs comps'
+  | "."::comps' -> symbolic_fs_resolve_comps fs comps'
+  | ".."::comps' -> symbolic_fs_resolve_comps (symbolic_fs_dotdot fs) comps'
+  | [file] -> Map.lookup file fs.contents
+  | dir::comps' ->
+     match symbolic_fs_subdir fs dir with
+     | Just fs' -> symbolic_fs_resolve_comps fs' comps'
+     | Nothing -> Nothing
+     end
+  end
+
+val symbolic_fs_resolve_path : symbolic_fs -> string -> maybe (file symbolic_fs)
+let symbolic_fs_resolve_path fs path =
+  let comps = split_string_on false (* not escapable *) #'/' path in
+  symbolic_fs_resolve_comps fs comps
+
+val symbolic_fs_resolve_dir : symbolic_fs -> string -> maybe symbolic_fs
+let symbolic_fs_resolve_dir fs path = 
+  match symbolic_fs_resolve_path fs path with
+  | Just (Dir fs') -> Just fs'
+  | _ -> Nothing
+  end
+
+(* empty FS/OS for testing purposes *)    
+let fs_empty =
+  <| parent = Nothing;
+     contents = Map.empty
+  |>
+
+(**********************************************************************)
+(* SYMBOLIC OS STATE **************************************************)
+(**********************************************************************)
+
+(* TODO 2018-09-04 have FIFO record which end we're working on
+
+   trickiness: renumber_fd then needs to save some of that data.
+   it's bigger refactor than you'd hope
+ *)
+type fd_tgt = FIFO of nat | Path of path
+
+(* Mapping of FDs numbers *)
+type fds = Map.map fd fd_tgt
+
+(* FIFO pipes for symbolic FDs *)             
+type fifo = string
+type fifo_num = nat
+
+type proc_stepped = Stepped of bool
+
+(* INVARIANT: first to process is at the front of the list (so add at the back, please) *)
+type proc_signals = list signal
+
+val no_signals : proc_signals
+let no_signals = []
+
+(* TODO 2018-10-22 handle process groups? *)
+type proc_status = Proc_Running | Proc_Stopped
+
+type proc =
+    Shell of proc_status * stmt * shell_state * fds * proc_stepped * proc_signals
+  | Zombie of nat (* exit code *)
+
+type symbolic = <|
+    passwd: Map.map string string; (* TODO relate to /etc/passwd, emulate getpwnam properly in getpwdir *)
+    sh_fds: fds;
+    fs_root: fs;
+    fifos: list fifo;
+    procs: list proc;
+    umask: perms;
+    curpid: pid
+  |>
+
+type evaluation_trace_entry = evaluation_step * shell_state * symbolic * stmt
+
+type evaluation_trace = 
+  list evaluation_trace_entry * os_state symbolic
+    
+(* INVARIANT: the second number here is referring to the indices in os_empty.fifos below *)
+let fds_default : fds = 
+  Map.insert STDIN (FIFO 0) 
+ (Map.insert STDOUT (FIFO 1) 
+ (Map.insert STDERR (FIFO 2) 
+  Map.empty))
+
+let symbolic_empty : symbolic = <|
+    sh_fds = fds_default;
+    passwd = Map.empty;
+    fs_root = fs_empty;
+    fifos = ["" (* STDIN *)
+            ;"" (* STDOUT *)
+            ;"" (* STDERR *)
+            ];
+    procs = [Shell Proc_Running Done default_shell_state fds_default (Stepped false) no_signals];
+    umask = default_umask;
+    curpid = 0
+ |>
+
+let os_empty : os_state symbolic = 
+  <| symbolic = symbolic_empty; 
+     sh = default_shell_state;
+     log = [];
+     fuel = Just 500;
+  |>
+
+(**********************************************************************)
+(* SYMBOLIC PROCESS HANDLING ******************************************)
+(**********************************************************************)
+
+val proc_exit_status : proc -> maybe nat
+let proc_exit_status proc = 
+  match proc with
+  | Shell _ _ _ _ _ _ -> Nothing
+  | Zombie ec -> Just ec
+  end
+
+val proc_alive : proc -> bool
+let proc_alive proc =
+  match proc_exit_status proc with
+  | Nothing -> true
+  | Just _ -> false
+  end
+
+val proc_stepped : proc -> bool
+let proc_stepped proc =
+  match proc with
+  | Shell _ _ _ _ (Stepped b) _ -> b
+  | Zombie _ -> true (* since it can't step anyway *)
+  end
+
+val proc_stmt : os_state symbolic -> pid -> stmt
+let proc_stmt os pid =
+  match index os.symbolic.procs pid with
+  | Nothing -> Done
+  | Just (Zombie ec) -> 
+     simple_command "exit" [symbolic_string_of_string (stringFromNat ec)] Map.empty
+  | Just (Shell _ stmt _ _ _ _) -> stmt
+  end
+
+val symbolic_clear_stepped : os_state symbolic -> os_state symbolic
+let symbolic_clear_stepped os =
+  <| os with symbolic = 
+     <| os.symbolic with procs =
+        List.map (fun proc ->
+            match proc with
+            | Zombie _ -> proc
+            | Shell status stmt sh fds _stepped pending ->
+              Shell status stmt sh fds (Stepped false) pending
+            end)
+          os.symbolic.procs |> |>
+
+(* TECHNICAL DEBT 2019-07-03 clean up this process update idiom *)
+
+val proc_set_ec : os_state symbolic -> pid -> nat -> os_state symbolic
+let proc_set_ec os0 pid ec =
+  let m_procs' = adjust_nth os0.symbolic.procs pid (fun _proc -> (Zombie ec, ())) in
+  match m_procs' with
+  | Nothing -> os0
+  | Just (procs', ()) -> <| os0 with symbolic = <| os0.symbolic with procs = procs' |> |>
+  end
+
+val proc_set_stmt : os_state symbolic -> pid -> stmt -> os_state symbolic
+let proc_set_stmt os0 pid stmt =
+  let m_procs' = 
+    adjust_nth os0.symbolic.procs pid
+      (fun proc ->
+        match proc with
+        | Zombie _ -> (proc, ())
+        | Shell status _stmt sh fds _stepped pending -> 
+           (Shell status stmt sh fds (Stepped true) pending, ())
+        end)
+  in
+  match m_procs' with
+  | Nothing -> os0
+  | Just (procs', ()) -> <| os0 with symbolic = <| os0.symbolic with procs = procs' |> |>
+  end
+  
+(* records current shell state in the process table *)
+val proc_save_state : os_state symbolic -> os_state symbolic
+let proc_save_state os0 =
+  let m_procs' = 
+    adjust_nth os0.symbolic.procs os0.symbolic.curpid
+      (fun proc ->
+        match proc with
+        | Zombie _ -> (proc, ())
+        | Shell status c _sh _fds stepped pending -> 
+           (Shell status c os0.sh os0.symbolic.sh_fds stepped pending, ())
+        end)
+  in
+  match m_procs' with
+  | Nothing -> 
+(*     let _ = Debug.print_endline ("couldn't save " ^ stringFromNat os0.symbolic.curpid) in *)
+     os0 
+  | Just (procs', ()) -> 
+(*     let _ = Debug.print_endline ("proc_save_state " ^ stringFromNat os0.symbolic.curpid) in *)
+     <| os0 with symbolic = <| os0.symbolic with procs = procs' |> |>
+  end
+
+type selected_proc =
+    SProc_NotFound
+  | SProc_Stopped
+  | SProc_Done of nat
+  | SProc_Running of stmt * proc_stepped
+
+val proc_select : os_state symbolic -> pid -> os_state symbolic * selected_proc
+let proc_select os0 pid =
+  let os1 = proc_save_state os0 in
+  match index os1.symbolic.procs pid with
+  | Nothing -> (os1, SProc_NotFound)
+  | Just (Zombie ec) -> 
+(*     let _ = Debug.print_endline ("proc_select done " ^ stringFromNat pid) in *)
+     (os1, SProc_Done ec)
+  | Just (Shell Proc_Stopped _c _sh' _fds' _stepped _pending) -> (os1, SProc_Stopped)
+  | Just (Shell Proc_Running c sh' fds' stepped _pending) ->
+(*     let _ = Debug.print_endline ("proc_select running " ^ stringFromNat pid) in *)
+     (<| (proc_save_state os1) with 
+           sh = sh';
+           symbolic = <| os1.symbolic with sh_fds = fds'; curpid = pid |> |>,
+      SProc_Running c stepped)
+  end
+  
+(**********************************************************************)
+(* SYMBOLIC OS STATE INSTANCE *****************************************)
+(**********************************************************************)
+
+val symbolic_resolve_fd : symbolic -> fd -> maybe nat
+let symbolic_resolve_fd symbolic fd =
+  match Map.lookup fd symbolic.sh_fds with
+  | Just (FIFO fifo_num) -> Just fifo_num
+  (* TODO 2018-03-23 is this the right behavior when fd points to a file? *)   
+  (* TODO 2018-03-02 is this the right behavior when fd doesn't exist? *)
+  | _ -> Nothing
+  end
+    
+val mkfifo : symbolic -> symbolic * fifo_num
+let mkfifo symbolic =
+  let fifo_num = length symbolic.fifos in
+  (<| symbolic with fifos = symbolic.fifos ++ [""] |>, fifo_num)
+
+val write_fifo : symbolic -> fifo_num -> string -> maybe (symbolic)
+let write_fifo symbolic fifo_num s =
+  match adjust_nth symbolic.fifos fifo_num (fun fifo_cts -> (fifo_cts ^ s, ())) with
+  | Nothing -> Nothing
+  | Just (new_fifos,()) -> Just <| symbolic with fifos = new_fifos |>
+  end
+
+(* TODO 2018-10-03 differentiate blocking and EOF 
+
+   really, we should use these reads as hints to the scheduler!
+*)
+val read_fifo : symbolic -> fifo_num -> maybe (symbolic * string)
+let read_fifo symbolic fifo_num =
+  match adjust_nth symbolic.fifos fifo_num (fun fifo_cts -> ("",fifo_cts)) with
+  | Nothing -> Nothing
+  | Just (new_fifos,s) -> Just (<| symbolic with fifos = new_fifos |>, s)
+  end
+
+val read_char_fifo : symbolic -> fifo_num -> maybe (symbolic * char)
+let read_char_fifo symbolic fifo_num =
+  let get_char fifo_cts =
+    match toCharList fifo_cts with
+    | [] -> ("", Nothing)
+    | c::cs -> (toString cs, Just c)
+    end
+  in
+  match adjust_nth symbolic.fifos fifo_num get_char with
+  | Nothing -> Nothing
+  | Just (new_fifos,Just c) -> Just (<| symbolic with fifos = new_fifos |>, c)
+  | Just (_, Nothing) -> Nothing
+  end
+
+val string_read_line_cl 
+    : list char -> escape_mode -> list char ->
+      list char * list char * read_eof
+let rec string_read_line_cl cs escapes line =
+  (* dash miscbltin.c:162 ignores nullchar? *)
+  match (cs, escapes) with
+  (* terminator *)
+  | ([], _) -> (line, [], ReadEOF)
+  | (#'\n'::cs', _) -> (line, cs', ReadContinue)
+
+  (* backslash *)
+  | ([#'\\'], BackslashEscapes) -> (#'\\'::line, [], ReadEOF)
+  | (#'\\'::#'\n'::cs, BackslashEscapes) -> string_read_line_cl cs escapes     line
+  | (#'\\'::c    ::cs, BackslashEscapes) -> string_read_line_cl cs escapes (c::line)
+
+  (* ordinary char *)
+  | (c::cs, _) -> string_read_line_cl cs escapes (c::line)
+  end
+
+val string_read_line
+    : string -> escape_mode -> string * string * read_eof
+let string_read_line s escapes =
+  let (line_cs, rest, hit_eof) = 
+    string_read_line_cl (toCharList s) escapes []  
+  in
+  (toString (reverse line_cs), toString rest, hit_eof)
+
+val symbolic_fresh_fd : fds -> fd
+let symbolic_fresh_fd sh_fds = 
+  match Set.findMax (Map.domain sh_fds) with
+  | Nothing -> 0
+  | Just max -> max + 1
+  end
+
+val symbolic_fds_reads_fifo : fifo_num -> fds -> bool
+let symbolic_fds_reads_fifo fifo_num fds =
+  let select_readers _fd fd_tgt =
+    match fd_tgt with
+    | FIFO fifo_num' -> 
+       if fifo_num = fifo_num'
+       then Just (FIFO fifo_num')
+       else Nothing
+    | Path _ -> Nothing
+    end
+  in
+  (* any FDs are writing our FIFO? *)
+  let readers = Map_extra.mapMaybe select_readers fds in
+  not (Map.null readers)
+
+val symbolic_has_reader : os_state symbolic -> fifo_num -> bool
+let symbolic_has_reader os fifo_num = 
+  (* STDOUT and STDERR always have readers, let's pretend *)
+  fifo_num = 1 || fifo_num = 2 || 
+  (* do any other processes read this FIFO? *)
+  let procs = mapi (fun pid proc -> (pid,proc)) os.symbolic.procs in
+  let all_fds = 
+    List.mapMaybe (fun (pid,proc) ->
+        if pid <> os.symbolic.curpid
+        then match proc with
+             | Shell _ _ _ fds _ _ -> Just fds
+             | Zombie _ -> Nothing
+             end
+        else Nothing) procs 
+  in
+  any (symbolic_fds_reads_fifo fifo_num) all_fds
+
+val symbolic_fds_writes_fifo : fifo_num -> fds -> bool
+let symbolic_fds_writes_fifo fifo_num fds =
+  let select_writers fd fd_tgt =
+    match fd_tgt with
+    | FIFO fifo_num' -> 
+       if fd <> STDIN && fifo_num = fifo_num'
+       then Just (FIFO fifo_num')
+       else Nothing
+    | Path _ -> Nothing
+    end
+  in
+  (* any FDs are writing our FIFO? *)
+  let writers = Map_extra.mapMaybe select_writers fds in
+  not (Map.null writers)
+
+val symbolic_writes_fifo : fifo_num -> proc -> bool
+let symbolic_writes_fifo fifo_num proc =
+  match proc with
+  | Zombie _ -> false
+  | Shell _ _ _ fds _ _ -> symbolic_fds_writes_fifo fifo_num fds
+  end
+
+val symbolic_find_writer : os_state symbolic -> fifo_num -> list pid
+let symbolic_find_writer os fifo_num = 
+  (* recall that symbolic PIDs are indices into the list 
+     so we'll just paw through it and find the first one that's writing
+   *)
+  let writers = findIndices (symbolic_writes_fifo fifo_num) os.symbolic.procs in
+  filter (fun pid -> pid <> os.symbolic.curpid) writers
+
+(* a recursive knot:
+   writing to an FD can cause SIGPIPE
+   sending a signal might need to write to an FD 
+ *)
+let rec symbolic_write_fd os fd s =
+  match symbolic_resolve_fd os.symbolic fd with
+  | Just fifo_num -> 
+     match write_fifo os.symbolic fifo_num s with
+     | Nothing -> Nothing
+     | Just symbolic' -> 
+        (* write succeeded... but are there readers left? *)
+        if symbolic_has_reader os fifo_num 
+        then Just <| os with symbolic = symbolic' |>
+        else (* send SIGPIPE *)
+(*          let _ = Debug.print_endline ("SIGPIPE to " ^ stringFromNat os.symbolic.curpid) in *)
+          let (os', _sent) = symbolic_signal_pid os SIGPIPE os.symbolic.curpid SignalProcess in
+          Just os'
+     end
+  | Nothing -> Nothing
+  end
+
+and symbolic_write_stderr s os =
+  match symbolic_write_fd os STDERR s with
+  | Nothing -> os
+  | Just os' -> os'
+  end
+
+and symbolic_log_trace s os = log_trace_with symbolic_write_stderr s os
+
+and proc_receive_signal os0 signal pid _as_pg proc =
+  match proc with
+  | Zombie _ec -> (os0, false)
+  | Shell status stmt proc_sh proc_fds stepped pending ->
+     let (os1, proc') = 
+       match Map.lookup signal proc_sh.traps with
+       | Nothing -> 
+          match signal_default_behavior signal with
+          | SigBeh_Terminate actions ->
+           let os1 =
+             if actions
+             then symbolic_log_trace Trace_unspec "Implementation-defined abnormal termination actions, such as creation of a core file, may also occur." os0
+             else os0
+           in
+           let ec = 128 + platform_int_of_signal signal in
+           (os1, Zombie ec)
+          | SigBeh_Ignore ->
+             let os1 = 
+               symbolic_log_trace Trace_traps (string_of_signal signal ^ " ignored by process with pid " ^ stringFromNat pid) os0 
+             in
+             (os1, proc)
+          | SigBeh_Stop ->
+             (os0, Shell Proc_Stopped stmt proc_sh proc_fds stepped pending)
+          | SigBeh_Continue ->
+             (os0, Shell Proc_Running stmt proc_sh proc_fds stepped pending)
+            end
+       | Just _ -> 
+(*          let _ = Debug.print_endline ("recorded pending signal " ^ string_of_signal signal ^ " " ^ stringFromNat pid) in *)
+         (os0, Shell status stmt proc_sh proc_fds stepped (pending ++ [signal]))
+       end
+     in
+     (<| os1 with symbolic = 
+         <| os1.symbolic with procs = update os1.symbolic.procs pid proc' |> |>, 
+      true)
+  end
+
+and symbolic_signal_pid os0 signal pid _as_pg = 
+(*  let _ = Debug.print_endline ("symbolic_signal_pid " ^ string_of_signal signal ^ " " ^ stringFromNat pid) in *)
+  (* make sure we're synced up *)
+  let os1 = proc_save_state os0 in
+  match index os1.symbolic.procs pid with
+  | Nothing -> (os1, false) (* not found *)
+  | Just proc -> proc_receive_signal os1 signal pid _as_pg proc
+  end
+
+let symbolic_step_pid step_eval os0 pid =
+  let (os1, selected) = proc_select os0 pid in
+  match selected with
+  | SProc_NotFound -> (os1, Nothing) (* not found, zombie, or stopped *)
+  | SProc_Done ec -> (os1, Just (Right ec))
+  | SProc_Stopped ->
+     let os2 = symbolic_write_stderr ("warning: process with pid " ^ stringFromNat pid ^ " is stopped") os1 in
+     (os2, Nothing)
+  | SProc_Running stmt (Stepped true) ->
+     (os1, Just (Left (XSNested (XSSimple "already stepped") (XSProc pid stmt))))
+  | SProc_Running stmt (Stepped false) ->
+(*     let _ = Debug.print_endline ("symbolic_step_pid pid=" ^ stringFromNat pid ^ " curpid=" ^ stringFromNat os0.symbolic.curpid) in *)
+     let (step, os2, stmt') = step_eval os1 Unchecked stmt in
+     let (os3, res) = 
+       match stmt' with
+       | Done ->
+          (* we manually simulate the EXIT trap here *)
+          let (os3, m_handler) = exit_trap os2 in
+          match m_handler with
+          | Just handler ->
+             (* update with the EXIT trap *)
+             (proc_set_stmt os3 pid handler,
+              Just (Left (XSNested (XSSimple "trapped on EXIT") (XSProc pid handler))))
+          | Nothing ->        
+            (* terminated! grab the code, update everything *)
+            (* TODO 2019-04-29 should also close any open FDs 
+               this behavior is important for pipes, but it means we need to track more writer info
+             *)
+             let ec = os3.sh.exit_code in
+             (proc_set_ec os3 pid ec, 
+              Just (Right ec))
+          end
+       | _ ->
+          (proc_set_stmt os2 pid stmt',
+           Just (Left (XSNested step (XSProc pid stmt'))))
+       end
+    in
+    (* restore the original state *)
+    (fst (proc_select os3 os0.symbolic.curpid), res)
+  end
+
+let symbolic_file_type os path =   
+    match symbolic_fs_resolve_path os.symbolic.fs_root path with
+    | Nothing -> Nothing
+    | Just File -> Just FileRegular
+    | Just (Dir _) -> Just FileDirectory
+    end
+
+let symbolic_file_type_follow os path =
+  (* TODO 2018-12-11 support links in the symbolic fs *)
+  symbolic_file_type os path   
+   
+instance (OS symbolic)
+  let os_tick os = symbolic_clear_stepped os
+
+  (* we don't want to actually send these to libdash, which will actually display
+     them on STDOUT when we're in interactive mode
+   *)
+  let os_set_ps1 os _new_ps1 = os
+  let os_set_ps2 os _new_ps2 = os
+  
+  let os_getpwnam os u = Map.lookup u os.symbolic.passwd
+
+  let os_execve os _prog _prog_argv0 _argv _env _binsh =
+    (os, Left "symbolic execve unimplemented")
+
+  let os_fork_and_subshell os stmt _bg _pgid _jc =
+    (* TODO 2018-10-24 if bg is false, this command will be controlling the terminal
+       should record that in symbolic state for fancier symbolic signal handling
+     *)
+    let proc_num = length os.symbolic.procs in
+    (* prepare_subshell/clear_traps_for_subshell already emptied traps
+       nothing else to do with the handlers 
+     *)
+    let (subsh,_handlers) = prepare_subshell os.sh in
+    let proc = Shell Proc_Running (try_avoid_fork stmt) subsh os.symbolic.sh_fds (Stepped false) no_signals in
+    (* When a subshell is entered, traps that are not being ignored
+       shall be set to the default actions, except in the case of a
+       command substitution containing only a single trap command,
+       when the traps need not be altered. Implementations may check
+       for this case using only lexical analysis; for example, if
+       `trap` and $( trap -- ) do not alter the traps in the subshell,
+       cases such as assigning var=trap and then using $($var) may
+       still alter them. This does not imply that the trap command
+       cannot be used within the subshell to set new traps.  *) 
+    (<| os with symbolic = <| os.symbolic with procs = os.symbolic.procs ++ [proc] |> |>, 
+     proc_num)
+
+  let os_exit os0 = 
+    proc_set_ec os0 os0.symbolic.curpid os0.sh.exit_code
+
+  let os_waitpid step_eval os0 pid  = symbolic_step_pid step_eval os0 pid
+
+  let os_waitchild os0 = (os0, Nothing)
+
+  let os_handle_signal os _signal _action = os
+
+  let os_signal_pid os0 signal pid as_pg = symbolic_signal_pid os0 signal pid as_pg
+
+  let os_pending_signal os0 =
+    let m_procs' = 
+      adjust_nth os0.symbolic.procs os0.symbolic.curpid 
+        (fun proc ->
+          match proc with
+          | Zombie _ec -> (proc, Nothing)
+          | Shell _status _stmt _sh _fds _stepped [] -> (proc, Nothing)
+          | Shell _status _stmt _sh _fds _stepped (signal::pending) ->
+            (Shell _status _stmt _sh _fds _stepped pending, Just signal)
+          end)
+    in
+    match m_procs' with
+    | Nothing -> 
+       Assert_extra.failwith ("os_pending_signal: couldn't find current process " ^
+                                stringFromNat os0.symbolic.curpid)
+    | Just (procs', m_sig) ->
+       (<| os0 with symbolic = <| os0.symbolic with procs = procs' |> |>,
+        m_sig)
+    end
+
+  let os_tc_setfg os0 _pid = 
+    (* TODO 2018-10-30 track console control info *)
+    (os0, false)
+
+  let os_set_job_control os0 _on = os0
+
+  let os_times _os0 = ("0m0s", "0m0s", "0m0s", "0m0s")
+
+  let os_get_umask os0 = os0.symbolic.umask
+
+  let os_set_umask os0 mask = 
+    <| os0 with symbolic = <| os0.symbolic with umask = mask |> |>
+
+  let os_readdir os path =
+    (* TODO 2018-08-21 will be buggy on non-absolute paths *)
+    match symbolic_fs_resolve_dir os.symbolic.fs_root path with
+    | Nothing -> Set.empty
+    | Just fs -> 
+       Set.map (fun (name,file) ->
+           (name,
+            match file with
+            | File -> File
+            | Dir _ -> Dir ()
+            end))
+         (* Only compare equality for the set based on the keys.
+          * Comparing equality of a non-trivial file system will loop infinitely. *)
+         (toSetBy compare_by_first fs.contents)
+    end
+
+  let os_physical_cwd os = os.sh.cwd
+
+  let os_chdir os path =
+    match symbolic_fs_resolve_dir os.symbolic.fs_root path with
+    | Nothing -> (os,Just ("no such directory: " ^ path))
+    | Just _ -> (<| os with sh = <| os.sh with cwd = path |> |>, Nothing)
+    end
+
+  (* TODO 2018-09-04 symbolic fs needs file contents/types *)
+  let os_file_exists os path =
+    match symbolic_fs_resolve_path os.symbolic.fs_root path with
+    | Nothing -> false
+    | Just _ -> true
+    end
+
+  let os_file_size os path =
+    match symbolic_fs_resolve_path os.symbolic.fs_root path with
+    | Nothing -> Nothing
+    | Just (Dir _) -> Just 512 (* simulating result of stat call *)
+    | Just File -> Just 1 (* TODO 2018-10-05 symbolic fs needs file contents *)
+    end
+
+  (* TODO 2018-10-05 symbolic fs needs perms *)
+  let os_file_perms os path =
+    match symbolic_fs_resolve_path os.symbolic.fs_root path with
+    | Nothing -> Nothing
+    | Just (Dir _) -> Just (invert_perms default_umask)
+    | Just File -> Just (invert_perms default_umask)
+    end
+
+  let os_file_type os path = symbolic_file_type os path
+
+  let os_file_type_follow os path = symbolic_file_type_follow os path
+
+  let os_is_tty os fd =
+    match symbolic_resolve_fd os.symbolic fd with
+    | Just fifo_num ->
+       (* if it points to our original TTY and we're interactive, yup! *)
+       elem fifo_num [STDIN; STDOUT; STDERR] && 
+       is_interactive os
+    | Nothing -> false
+    end
+
+   (* TODO 2018-10-04 real permissions? *)
+  let os_is_readable os path =
+    match symbolic_fs_resolve_path os.symbolic.fs_root path with
+    | Nothing -> false
+    | Just _ -> true
+    end
+
+  let os_is_writeable os path =
+    match symbolic_fs_resolve_path os.symbolic.fs_root path with
+    | Nothing -> false
+    | Just _ -> true
+    end
+
+  let os_is_executable os path =
+    match symbolic_fs_resolve_path os.symbolic.fs_root path with
+    | Nothing -> false
+    | Just _ -> true
+    end
+
+  (* TODO 2019-05-21 need to track this info, too... *)
+  let os_file_mtime _os _path = Nothing
+  let os_file_number _os _path = Nothing
+
+  let os_write_fd = symbolic_write_fd
+
+  let os_read_all_fd step_eval os0 fd =
+    match symbolic_resolve_fd os0.symbolic fd with
+    | Just fifo_num -> 
+       let commit_read os =
+         match read_fifo os.symbolic fifo_num with
+          | Nothing -> 
+             (os, Right Nothing)
+          | Just (symbolic', s) -> (<| os with symbolic = symbolic' |>, Right (Just s))
+          end
+       in
+       match symbolic_find_writer os0 fifo_num with
+       (* no writer: go ahead and read the FIFO *)
+       | [] -> 
+          commit_read os0
+       (* there's an active writer... step it and see *)
+       (* TODO 2019-07-03 should step ALL of the writers *)
+       | pid::_ -> 
+          let (os1, m_step) = symbolic_step_pid step_eval os0 pid in
+          match m_step with
+          | Nothing -> commit_read os1
+          | Just (Left step) -> (os1, Left step)
+          | Just (Right _ec) -> commit_read os1
+          end
+       end
+    | Nothing -> (os0, Right Nothing)
+  end
+
+  let os_read_line_fd os fd escapes =
+    match symbolic_resolve_fd os.symbolic fd with
+    | Just fifo_num -> 
+       (* look up the FIFO contents *)
+       match index os.symbolic.fifos fifo_num with
+       | Nothing -> (os, ReadError "broken pipe ")
+       | Just cts ->
+          (* try to parse a line *)
+          let (line,cts',hit_eof) = string_read_line cts escapes in
+          (* we'll return this value if the read is good. but it depends!
+             
+             if we really parsed a line (no EOF), we're good. otherwise we may
+             have to block on the writing process.
+           *)
+          let commit_read = 
+            (<| os with symbolic = 
+                <| os.symbolic with 
+                   fifos = update os.symbolic.fifos fifo_num cts' |> |>, 
+             ReadSuccess line hit_eof)
+          in
+          if not (read_eof hit_eof)
+          then 
+            (* we actually parsed a line---no need to block, we have what we need 
+               so we'll update the FIFO to holds cts' and return the string
+             *)
+            commit_read
+          else
+            (* found EOF. is someone still writing to this FIFO?
+               if so, we need to throw away our (uncommitted) read and block.
+               if not, fine: EOF it is *)
+            (* TODO 2019-07-03 should step ALL of the writers *)
+            match symbolic_find_writer os fifo_num with
+            | [] -> commit_read
+            | pid::_ -> (os, ReadBlocked pid)
+            end
+       end
+    | Nothing -> (os, ReadError ("bad file descriptor " ^ stringFromNat fd))
+    end
+
+  let os_close_fd os fd = 
+    <| os with symbolic = <| os.symbolic with sh_fds = Map.delete fd os.symbolic.sh_fds |> |>
+
+  let os_pipe os0 =
+    let (sym1, fifo_num) = mkfifo os0.symbolic in
+    (* get an FD number for reading *)
+    let fd_read = symbolic_fresh_fd sym1.sh_fds in
+    let fds' = Map.insert fd_read (FIFO fifo_num) sym1.sh_fds in
+    (* get an FD number for writing *)
+    let fd_write = symbolic_fresh_fd fds' in
+    let fds'' = Map.insert fd_write (FIFO fifo_num) fds' in
+    (<| os0 with symbolic = <| sym1 with sh_fds = fds'' |> |>, fd_read, fd_write)
+
+  let os_open_file_for_redir os0 _ty file = 
+    (* TODO 2019-04-11 actually look at fs *)
+    let fd = symbolic_fresh_fd os0.symbolic.sh_fds in
+    let (os1,_,sfile) = concretize os0 file in
+    let sh_fds' = Map.insert fd (Path sfile) os1.symbolic.sh_fds in
+    let os2 = <| os1 with symbolic = <| os1.symbolic with sh_fds = sh_fds' |> |> in
+    (os2, Right fd)
+
+  let os_open_heredoc os0 s =
+    let (sym1, fifo_num) = mkfifo os0.symbolic in
+    let fd = symbolic_fresh_fd sym1.sh_fds in
+    (* update the FD map with a read FD *)
+    let sym2 = <| sym1 with sh_fds = Map.insert fd (FIFO fifo_num) sym1.sh_fds |> in
+    (* don't bother making a write FD, just write to the FIFO buffer *)
+    match write_fifo sym2 fifo_num s with
+    | Nothing -> Left "broken pipe"
+    | Just sym3 -> Right (<| os0 with symbolic = sym3 |>, fd)
+    end
+
+  (* TODO 2018-12-14 This isn't 100% faithful to what an implementation
+     can do.
+
+     Because we're simulating all of POSIX, we don't need to
+     _actually_ dup2 anything.  But a real implementation will choose an
+     fd >= 10 for renumbering, since the shell is only guaranteed to have
+     fds 0-9.
+   *)
+  let os_close_and_save_fd os0 fd = 
+    (* precomupte potential next os *)
+    let sym1 = <| os0.symbolic with sh_fds = Map.delete fd os0.symbolic.sh_fds |> in
+    let os1 = <| os0 with symbolic = sym1 |> in
+    match Map.lookup fd os0.symbolic.sh_fds with
+    | Nothing -> 
+       (* already closed, nothing to save *)
+       (os1, Right [])
+    | Just (FIFO fifo_num) ->
+       (* hold on to the FIFO number *)
+       (os1, Right [(fd, Saved fifo_num)])
+    | Just (Path _path) ->
+       (os1, Left "TODO 2018-08-24 symbolic path FDs unimplemented")
+    end
+
+  let os_renumber_fd os0 orig_action new_fd wanted_fd = 
+    if new_fd = wanted_fd
+    then (os0, Right (if should_close_orig orig_action then [(wanted_fd, Close)] else []))
+    else
+      match Map.lookup new_fd os0.symbolic.sh_fds with
+      | Nothing -> 
+         (os0, Left "broken pipe (tried to renumber closed fd)")
+      | Just new_tgt ->
+        let saved = 
+          match Map.lookup wanted_fd os0.symbolic.sh_fds with
+          | Nothing -> 
+             (* the wanted_fd is free... great! *)
+             []
+          | Just (FIFO fifo_num) ->
+             (* the wanted fd is in use, points to a fifo... hold on to the number *)
+             [(wanted_fd, Saved fifo_num)]
+          | Just (Path _path) ->
+             (* the wanted fd is in use, points to a file *)
+             (* TODO 2018-08-24 symbolic path FDs unimplemented *)
+             []
+          end in
+        let fds0 = Map.insert wanted_fd new_tgt os0.symbolic.sh_fds in
+        let fds1 = if should_close_orig orig_action then Map.delete new_fd fds0 else fds0 in
+        (<| os0 with symbolic = <| os0.symbolic with sh_fds = fds1 |> |>,
+         Right saved)
+      end
+
+  let os_restore_fd os0 fd info =
+    match info with
+    | Saved fifo_num -> 
+       let fds = Map.insert fd (FIFO fifo_num) os0.symbolic.sh_fds in
+       <| os0 with symbolic = <| os0.symbolic with sh_fds = fds |> |>
+    | Close ->
+       let fds = Map.delete fd os0.symbolic.sh_fds in
+       <| os0 with symbolic = <| os0.symbolic with sh_fds = fds |> |>
+    end
+end
+
+val set_pwdir : string -> string -> os_state symbolic -> os_state symbolic
+let set_pwdir u d os = 
+  <| os with symbolic = <| os.symbolic with passwd = Map.insert u d (os.symbolic.passwd) |> |>
+
+val get_stdout : os_state symbolic -> string
+let get_stdout os = fromMaybe "" (index os.symbolic.fifos 1)
+
+val get_stderr : os_state symbolic -> string
+let get_stderr os = fromMaybe "" (index os.symbolic.fifos 2)
+
+val symbolic_set_param : string -> string -> os_state symbolic -> os_state symbolic
+let symbolic_set_param x v os = 
+  match set_param x (symbolic_string_of_string v) os with
+  | Left _err -> os
+  | Right os' -> os'
+  end

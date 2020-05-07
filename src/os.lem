@@ -1,0 +1,1470 @@
+open import Smoosh_prelude
+include import Signal_platform
+import Debug
+
+(* This file defines the interface to the OS that the shell uses.
+
+   It happens in four parts:
+
+   - OS state types
+
+   - functions that don't involve system calls
+
+   - OS system call interface (type class)
+
+   - functions that use system calls
+
+   One subtlety is that helpers that use the OS type class can't be
+   used when defining the class itself. Annoying! This can be resolved
+   with higher-order helpers (e.g., `log_trace_with`).
+
+   The OS system call interface consists of a bunch of functions
+   prefixed with `os_`. These should never be called directly by the
+   shell; instead, use the unprefixed versions, which will trace
+   system calls appropriately.
+
+   Finally, what we call system calls here aren't in a one-to-one
+   correspondence with POSIX system calls. Some calls are broken up
+   (e.g., `stat` and `lstat`) while others are grouped together (e.g,
+   `set_job_control`). Some aren't system calls at all, but are just a
+   way of interfacing with the parser (e.g., `set_ps1`). 
+
+ *)
+                                   
+(**********************************************************************)
+(* OS STATE ***********************************************************)
+(**********************************************************************)
+
+type log_entry =
+    LogTrace of trace_tag * string
+  | LogConcretization of symbolic_string
+  | LogStep of evaluation_step
+
+val string_of_log_entry : log_entry -> string
+let string_of_log_entry entry =
+  match entry with
+  | LogTrace tag msg -> "[" ^ string_of_trace_tag tag ^ "] " ^ msg
+  | LogConcretization ss -> "[concretized] " ^ string_of_symbolic_string ss
+  | LogStep step -> "[step] " ^ string_of_evaluation_step step
+  end
+
+(* The actual OS state. *)
+type os_state 'a = <| 
+   symbolic: 'a; 
+   sh: shell_state;
+   log: list log_entry;
+   fuel: maybe nat;
+ |> 
+
+(* Parameter helpers **************************************************)
+   
+type local_binding = 
+    LocalNotFound 
+  | LocalUnset of local_opts
+  | LocalSet of symbolic_string * local_opts
+
+val pop_locals : forall 'a. os_state 'a -> os_state 'a * local_env
+let pop_locals os =
+  match os.sh.locals with
+  | [] -> Assert_extra.failwith "pop_locals"
+  | outer::locals' -> (<| os with sh = <| os.sh with locals = locals' |> |>, outer)
+  end
+
+val push_locals : forall 'a. os_state 'a -> env -> os_state 'a
+let push_locals os env =
+  let local_env = Map.map (fun v -> (Just v, local_opts_default)) env in
+  <| os with sh = <| os.sh with locals = local_env::os.sh.locals |> |>
+
+val new_local_scope : forall 'a. os_state 'a -> os_state 'a
+let new_local_scope os =
+  <| os with sh = <| os.sh with locals = Map.empty::os.sh.locals |> |>
+
+val get_locals_loop : list local_env -> set string
+let rec get_locals_loop locals =
+  match locals with
+  | [] -> Set.empty
+  | env::locals' -> Set.(union) (Map.domain env) (get_locals_loop locals')
+  end
+
+val get_locals : forall 'a. os_state 'a -> list string
+let get_locals os = Set_extra.toOrderedList (get_locals_loop os.sh.locals)
+
+val lookup_local_param_loop : string -> list local_env -> local_binding
+let rec lookup_local_param_loop x locals =
+  match locals with
+  | [] -> LocalNotFound
+  | env::locals' ->
+     match Map.lookup x env with
+     | Nothing -> lookup_local_param_loop x locals'
+     | Just (Nothing, opts) -> LocalUnset opts
+     | Just (Just ss, opts) -> LocalSet ss opts
+     end
+  end
+
+val lookup_local_param : forall 'a. os_state 'a -> string -> local_binding
+let lookup_local_param os x = lookup_local_param_loop x os.sh.locals
+
+val is_readonly : forall 'a. string -> os_state 'a -> bool
+let is_readonly var os = 
+  match lookup_local_param os var with
+  | LocalNotFound -> Set.member var os.sh.readonly
+  | LocalUnset opts -> opts.local_readonly
+  | LocalSet _ opts -> opts.local_readonly
+  end
+
+val check_param : forall 'a. string -> os_state 'a -> maybe string (* err msg *)
+let check_param x os0 =  
+  if is_readonly x os0
+  then Just (x ^ ": is read only")
+  else if is_special_param x
+  then Just (x ^ ": is a special parameter and not a valid identifier")
+  else Nothing
+                            
+val set_local_param_opts_loop : string -> (local_opts -> local_opts) -> list local_env -> maybe (list local_env)
+let rec set_local_param_opts_loop x upd locals =
+  match locals with
+  | [] -> Nothing
+  | env::locals' ->
+     match Map.lookup x env with
+     | Nothing -> 
+        (* not in this level of locals... recur! *)
+        match set_local_param_opts_loop x upd locals' with
+        | Nothing -> Nothing
+        | Just set_locals -> Just (env::set_locals)
+        end
+     | Just (v, opts) ->
+        let env' = Map.insert x (v, upd opts) env in
+        Just (env'::locals')
+     end
+  end
+
+val set_local_param_opts : forall 'a. os_state 'a -> string -> (local_opts -> local_opts) -> os_state 'a * bool
+let set_local_param_opts os x upd =
+  match set_local_param_opts_loop x upd os.sh.locals with
+  | Nothing -> (os, false)
+  | Just locals' -> (<| os with sh = <| os.sh with locals = locals' |> |>, true)
+  end
+
+val set_local_param_loop : string -> maybe symbolic_string -> list local_env -> maybe (list local_env)
+let rec set_local_param_loop x m_v locals =
+  match locals with
+  | [] -> Nothing
+  | env::locals' ->
+     match Map.lookup x env with
+     | Nothing -> 
+        (* not in this level of locals... recur! *)
+        match set_local_param_loop x m_v locals' with
+        | Nothing -> Nothing
+        | Just set_locals -> Just (env::set_locals)
+        end
+     | Just (_, opts) ->
+        (* we don't bother checking readonly here---we'll do it elsewhere *)
+        let env' = Map.insert x (m_v, opts) env in
+        Just (env'::locals')
+     end
+  end
+
+val set_local_param : forall 'a. os_state 'a -> string -> maybe symbolic_string -> os_state 'a * bool
+let set_local_param os x m_v =
+  match set_local_param_loop x m_v os.sh.locals with
+  | Nothing -> (os, false)
+  | Just locals' -> (<| os with sh = <| os.sh with locals = locals' |> |>, true)
+  end
+
+val force_local_param : forall 'a. os_state 'a -> string -> symbolic_string -> either string (os_state 'a)
+let force_local_param os x v =
+  match os.sh.locals with
+  | [] -> Assert_extra.failwith "force_local_param missing local scope"
+  | env::locals' ->
+     match check_param x os with
+     | Just err -> Left err
+     | Nothing ->
+        let env' = Map.insert x (Just v, local_opts_default) env in
+        Right <| os with sh = <| os.sh with locals = env'::locals' |> |>
+     end
+  end                                      
+
+val lookup_positional_param : forall 'a. nat -> os_state 'a -> maybe symbolic_string
+let lookup_positional_param num os = index os.sh.positional_params num
+
+val get_function_params : forall 'a. os_state 'a -> fields
+let get_function_params os =
+  match os.sh.positional_params with
+  | [] -> []
+  | _::argv -> argv
+  end
+
+(* The result is nothing if the parameter is unset, and the empty string if it's null. *)
+val lookup_string_param : forall 'a. os_state 'a -> string -> maybe symbolic_string
+let lookup_string_param os str =
+  match (readNat (toCharList str),str) with
+  | (Right num,_) -> lookup_positional_param num os
+  | (Left _,"$") -> Just (symbolic_string_of_nat os.sh.rootpid)
+  | (Left _,"@") -> Assert_extra.failwith "broken invariant: called lookup_string_param on @"
+  | (Left _,"*") -> Assert_extra.failwith "broken invariant: called lookup_string_param on *"
+  | (Left _,"?") -> Just (symbolic_string_of_string (stringFromNat os.sh.exit_code))
+  | (Left _,"-") -> 
+     let char_opts = List.mapMaybe char_of_sh_opt (Set_extra.toList os.sh.opts) in
+     Just (symbolic_string_of_string (toString char_opts))
+  | (Left _, "!") ->
+     match os.sh.last_pid with
+     | Nothing -> Nothing
+     | Just pid -> Just (symbolic_string_of_string (stringFromNat pid))
+     end
+  | (Left _,"#") -> 
+     let num_params = length os.sh.positional_params in
+     Just (symbolic_string_of_string (stringFromNat (max 0 (num_params - 1))))
+     (* number of positional arguments excluding $0 *)
+  | (Left _,_) -> 
+     match lookup_local_param os str with
+     | LocalNotFound -> Map.lookup str os.sh.env
+     | LocalUnset _opts -> Nothing (* bash returns empty string; dash looks up in parent *)
+     | LocalSet ss _opts -> Just ss
+     end
+  end
+
+val lookup_param : forall 'a. os_state 'a -> string -> maybe fields
+let lookup_param os str =
+  if str = "@" || str = "*"
+  then Just (get_function_params os)
+  else match lookup_string_param os str with
+       | Nothing -> Nothing
+       | Just v -> Just [v]
+       end
+
+val lookup_concrete_param : forall 'a. os_state 'a -> string -> maybe string
+let lookup_concrete_param os str =
+  match lookup_param os str with
+  | Nothing -> Nothing
+  | Just fs -> try_concrete_fields fs
+  end
+
+val printable_shell_env : forall 'a. os_state 'a -> string
+let printable_shell_env os = 
+  foldr (fun (k, v) s -> k ^ "=" ^ quote (string_of_symbolic_string v) ^ "\n" ^ s) 
+    "" 
+    (Map_extra.toList os.sh.env)
+
+val ps1 : forall 'a. os_state 'a -> string
+let ps1 os =
+  match lookup_concrete_param os "PS1" with
+  | Nothing -> "$ "
+  | Just prompt -> prompt
+  end
+
+val ps4 : forall 'a. os_state 'a -> string
+let ps4 os =
+  match lookup_concrete_param os "PS4" with
+  | Nothing -> "+ "
+  | Just prompt -> prompt
+  end
+
+val get_path : forall 'a. os_state 'a -> string
+let get_path os =
+  match lookup_concrete_param os "PATH" with
+  | Nothing -> ""
+  | Just path -> path
+  end
+
+val set_readonly : forall 'a. os_state 'a -> string -> os_state 'a
+let set_readonly os0 x =
+  let (os1, found_local) = 
+    set_local_param_opts os0 x (fun opts -> <| opts with local_readonly = true |>) 
+  in
+  if found_local
+  then os1
+  else <| os1 with sh = <| os1.sh with readonly = Set.insert x os1.sh.readonly |> |>
+
+val set_exported : forall 'a. os_state 'a -> string -> os_state 'a
+let set_exported os0 x =
+  let (os1, found_local) = 
+    set_local_param_opts os0 x (fun opts -> <| opts with local_exported = true |>) 
+  in
+  if found_local
+  then os1
+  else <| os1 with sh = <| os1.sh with export = Set.insert x os1.sh.export |> |>
+
+type unset_env = map string (maybe symbolic_string)
+
+val collect_vars : forall 'a. (os_state 'a -> set string) -> (local_opts -> bool) -> os_state 'a -> unset_env
+let collect_vars get_globals select_local os =
+  let globals : unset_env = 
+    foldr (fun x m -> Map.insert x (lookup_string_param os x) m) Map.empty 
+      (Set_extra.toOrderedList (get_globals os))
+  in
+  let add_local (lenv : local_env) (env : unset_env) : unset_env =
+    let selected_locals =
+      Map_extra.mapMaybe
+        (fun _x (m_v, opts) ->
+          if select_local opts
+          then Just m_v
+          else Nothing)
+        lenv
+    in
+    (* override bindings in env with the local one *)
+    Map_extra.fold Map.insert env selected_locals
+  in
+  (* foldr will let more recent locals override less recent ones---the right behaviors *)
+  List.foldr add_local globals os.sh.locals
+
+val readonly_vars : forall 'a. os_state 'a -> unset_env
+let readonly_vars os = 
+  collect_vars (fun os -> os.sh.readonly) (fun opts -> opts.local_readonly) os
+
+val exported_vars : forall 'a. os_state 'a -> unset_env
+let exported_vars os = 
+  collect_vars (fun os -> os.sh.export) (fun opts -> opts.local_exported) os
+
+val exported_set_vars : forall 'a. os_state 'a -> env
+let exported_set_vars os = Map_extra.mapMaybe (fun _x m_v -> m_v) (exported_vars os)
+
+val internal_set_param 
+    : forall 'a. string -> symbolic_string -> os_state 'a -> os_state 'a
+let internal_set_param x v os0 =
+  let (os1, found_local) = set_local_param os0 x (Just v) in
+  if found_local
+  then os1
+  else <| os0 with sh = <| os0.sh with env = Map.insert x v os0.sh.env |> |>
+
+val unset_param : forall 'a. string -> os_state 'a -> os_state 'a
+let unset_param x os0 = 
+  let (os1, found_local) = set_local_param os0 x Nothing in
+  if found_local
+  then os1
+  else <| os1 with sh = <| os1.sh with 
+    env = Map.delete x os1.sh.env;
+    readonly = Set.delete x os1.sh.readonly;
+    export = Set.delete x os1.sh.export
+  |> |>
+
+(* Logging and history ************************************************)
+
+val log : forall 'a. log_entry -> os_state 'a -> os_state 'a
+let log entry os = <| os with log = entry::os.log |>
+
+val out_of_fuel : forall 'a. os_state 'a -> bool
+let out_of_fuel os =
+  match os.fuel with
+  | Nothing -> false
+  | Just n -> n = 0
+  end
+
+val string_of_fuel : forall 'a. os_state 'a -> string
+let string_of_fuel os =
+  match os.fuel with
+  | Nothing -> "unbounded"
+  | Just n -> stringFromNat n
+  end
+
+val entry_unspecified : log_entry -> bool
+let entry_unspecified entry =
+  match entry with
+  | LogTrace Trace_unspec _ -> true
+  | LogTrace Trace_undef _ -> true
+  | _ -> false
+  end
+
+val entry_undefined : log_entry -> bool
+let entry_undefined entry =
+  match entry with
+  | LogTrace Trace_undef _ -> true
+  | _ -> false
+  end
+
+val try_entry_step : log_entry -> maybe evaluation_step
+let try_entry_step entry =
+  match entry with
+  | LogStep step -> Just step
+  | _ -> Nothing
+  end
+
+val in_unspecified_state : forall 'a. os_state 'a -> bool
+let in_unspecified_state os = any entry_unspecified os.log
+
+val in_undefined_state : forall 'a. os_state 'a -> bool
+let in_undefined_state os = any entry_undefined os.log
+
+val extract_unspec : forall 'a. os_state 'a -> list string
+let extract_unspec os =
+  List.mapMaybe 
+    (fun entry ->
+      match entry with
+      | LogTrace Trace_unspec msg -> Just  ("[unspec] " ^ msg)
+      | LogTrace Trace_undef msg ->   Just ("[undef] " ^ msg)
+      | _ -> Nothing
+      end)
+    os.log
+
+val extract_trace : forall 'a. os_state 'a -> list evaluation_step
+let extract_trace os = List.mapMaybe try_entry_step os.log
+
+val log_step : forall 'a. evaluation_step -> os_state 'a -> os_state 'a
+let log_step step = log (LogStep step)
+
+val log_trace_with : forall 'a. (string -> os_state 'a -> os_state 'a) -> trace_tag -> string -> os_state 'a -> os_state 'a
+let log_trace_with write tag msg os0 =
+  let entry = LogTrace tag msg in
+  let os1 = log entry os0 in
+  if Set.member (Sh_trace tag) os1.sh.opts
+  then write (ps4 os0 ^ string_of_log_entry entry ^ "\n") os1
+  else os1
+
+val log_concretization : forall 'a. symbolic_string -> os_state 'a -> os_state 'a
+let log_concretization ss = log (LogConcretization ss)
+
+val histwrap : forall 'a. os_state 'a -> nat
+let histwrap os =
+  (* When the number reaches an implementation-defined upper limit,
+     which shall be no smaller than the value in HISTSIZE or 32767
+     (whichever is greater), the shell may wrap the numbers, starting
+     the next command with a lower number (usually 1). *)
+  let hard_upper_limit = toNat int32Max in
+  match lookup_concrete_param os "HISTSIZE" with
+  | Nothing -> hard_upper_limit
+  | Just n_str -> 
+     let usr_n =
+       match readUnsignedInteger 10 (toCharList n_str) with
+       | Left _ -> (* yikes? *) hard_upper_limit
+       | Right n -> max (toNat n) 128
+       end
+     in
+     min usr_n hard_upper_limit
+  end
+
+val next_histnum : forall 'a. os_state 'a -> nat
+let next_histnum os =
+  match os.sh.history with
+  | [] -> 1
+  | (last,_)::_ -> 
+     if last = histwrap os
+     then 1
+     else last + 1
+  end
+
+val add_to_history : forall 'a. stmt -> os_state 'a -> os_state 'a
+let add_to_history c os =
+  if Set.member Sh_nolog os.sh.opts
+  then os
+  else
+    let histnum = next_histnum os in
+    <| os with sh = <| os.sh with history = (histnum,c)::os.sh.history |> |>
+
+(* Hashing ************************************************************)
+
+val clear_hash : forall 'a . os_state 'a -> os_state 'a
+let clear_hash os = 
+  <| os with sh = <| os.sh with hashes = Map.empty |> |>
+
+val hash_lookup : forall 'a. os_state 'a -> (path -> bool) -> string -> os_state 'a * maybe path
+let hash_lookup s0 ok prog =
+  match Map.lookup prog s0.sh.hashes with
+  | Nothing -> (s0, Nothing)
+  | Just (path, hits) ->
+     if ok path
+     then let s1 = <| s0 with sh = 
+                      <| s0.sh with hashes = 
+                         Map.insert prog (path, hits+1) s0.sh.hashes |> |>
+          in
+          (s1, Just path)
+     else let s1 = <| s0 with sh = 
+                      <| s0.sh with hashes = 
+                         Map.delete prog s0.sh.hashes |> |>
+          in
+          (s1, Just path)
+  end
+
+val hash_insert : forall 'a. os_state 'a -> string -> path -> os_state 'a
+let hash_insert os prog path =
+  <| os with sh = <| os.sh with hashes = 
+     Map.insert prog (path, 1) os.sh.hashes |> 
+  |>
+
+(* Concretization *****************************************************)
+
+val concretize 
+    : forall 'a. os_state 'a -> symbolic_string -> os_state 'a * bool * string
+let concretize os0 ss =
+  match try_concrete ss with
+  | Nothing -> (log_concretization ss os0, true, string_of_symbolic_string ss)
+  | Just s -> (os0, false, s)
+  end     
+
+val concretize_many 
+    : forall 'a. os_state 'a -> fields -> os_state 'a * bool * list string
+let concretize_many os0 f =
+  foldr 
+    (fun ss (os,before,strs) ->
+      let (os',now,str) = concretize os ss in
+      (os', now||before, str::strs))
+    (os0, false, [])
+    f
+
+val concretize_fields
+    : forall 'a. os_state 'a -> fields -> os_state 'a * bool * string
+let rec concretize_fields os0 f =
+  match f with
+  | [] -> (os0, false, "")
+  | [ss] -> concretize os0 ss
+  | ss::f' ->
+     let (os1, concretized1, s) = concretize os0 ss in
+     let (os2, concretized2, s') = concretize_fields os1 f' in
+     (os2, concretized1 || concretized2, s ^ " " ^ s')
+  end     
+
+(* Useful predicates **************************************************)
+
+val is_interactive : forall 'a. os_state 'a -> bool
+let is_interactive os = Set.member Sh_interactive os.sh.opts
+
+val interactivity_mode_of : forall 'a. os_state 'a -> interactivity_mode
+let interactivity_mode_of os = 
+  if is_interactive os
+  then Interactive
+  else Noninteractive
+
+val is_monitoring : forall 'a. os_state 'a -> bool
+let is_monitoring os = Set.member Sh_monitor os.sh.opts
+
+(* Exit codes *********************************************************)
+
+val exit_with : forall 'a. nat -> os_state 'a -> os_state 'a
+let exit_with ec os = 
+  <| os with sh = <| os.sh with exit_code = ec |> |>
+
+(* FS helpers *********************************************************)
+
+val path_dotdot_rev_cl : list char -> list char
+let rec path_dotdot_rev_cl path =
+  match path with
+  | [] -> [#'/'] (* stop at the root *)
+  | [#'/'] -> [#'/'] (* stop at the root *)
+  | #'/'::rest -> rest
+  | _::rest -> path_dotdot_rev_cl rest
+  end
+                            
+val dotdot : path -> path
+let dotdot path = toString (reverse (path_dotdot_rev_cl (reverse (toCharList path))))
+
+(* Functions and positional param management **************************)
+
+val defun : forall 'a. string -> stmt -> os_state 'a -> os_state 'a
+let defun name body os = 
+  <| os with sh = <| os.sh with funcs = Map.insert name body os.sh.funcs |> |>
+
+val lookup_function : forall 'a. string -> os_state 'a -> maybe stmt
+let lookup_function name os = Map.lookup name os.sh.funcs
+  
+val set_function_params : forall 'a. nat -> fields -> os_state 'a -> os_state 'a
+let set_function_params ln argv os =
+  let new_params =
+    match os.sh.positional_params with
+    | [] -> []::argv
+    | arg0::_ -> arg0::argv
+    end in
+  <| os with sh = <| os.sh with loop_nest = ln; positional_params = new_params |> |>
+
+val enter_loop : forall 'a. os_state 'a -> os_state 'a
+let enter_loop os = 
+  <| os with sh = <| os.sh with loop_nest = os.sh.loop_nest + 1 |> |>
+
+val exit_loop : forall 'a. os_state 'a -> os_state 'a
+let exit_loop os = 
+  <| os with sh = <| os.sh with loop_nest = os.sh.loop_nest - 1 |> |>
+
+val set_last_pid : forall 'a. pid -> os_state 'a -> os_state 'a
+let set_last_pid pid os =
+  <| os with sh = <| os.sh with last_pid = Just pid |> |>
+
+(* Job control ********************************************************)
+
+val ec_of_job_status : job_status -> maybe nat
+let ec_of_job_status status =
+  let ec_of_signal signal = Just (128 + Signal_platform.platform_int_of_signal signal) in
+  match status with
+  | JobRunning -> Nothing
+  | JobStopped TSTP -> ec_of_signal SIGTSTP
+  | JobStopped STOP -> ec_of_signal SIGSTOP
+  | JobStopped TTIN -> ec_of_signal SIGTTIN
+  | JobStopped TTOU -> ec_of_signal SIGTTOU
+  | JobTerminated signal -> ec_of_signal signal
+  | JobDone code -> Just code
+  end
+
+val job_status_of_ec : nat -> job_status
+let job_status_of_ec ec =
+  match List.find (fun signal -> ec = 128 + Signal_platform.platform_int_of_signal signal) Signal.all_signals with
+  | Just signal -> 
+     match signal with
+     | SIGTSTP -> JobStopped TSTP
+     | SIGTTIN -> JobStopped TTIN
+     | SIGTTOU -> JobStopped TTOU
+     | SIGSTOP -> JobStopped STOP
+     | _       -> JobTerminated signal
+     end
+  | Nothing -> JobDone ec
+  end
+
+val delete_job : forall 'a. os_state 'a -> nat (* job id *) -> os_state 'a
+let delete_job os0 id =
+  <| os0 with sh = 
+      <| os0.sh with jobs = filter (fun j -> j.id <> id || is_active_job j) os0.sh.jobs |> |>
+
+val delete_job_with_pid : forall 'a. os_state 'a -> pid -> os_state 'a
+let delete_job_with_pid os0 pid =
+  <| os0 with sh = 
+      <| os0.sh with jobs = filter (fun j -> j.pid <> pid || is_active_job j) os0.sh.jobs |> |>
+
+val find_job_with_pid : forall 'a. os_state 'a -> pid -> maybe job_info
+let find_job_with_pid os0 pid =
+  List.find (fun j -> j.pid = pid || any (fun (pid',_) -> pid' = pid) j.pipeline) 
+    os0.sh.jobs
+
+(* Traps **************************************************************)
+   
+val update_trap : forall 'a. os_state 'a -> signal -> maybe symbolic_string -> os_state 'a
+let update_trap os0 signal action =
+  match action with
+  | Nothing -> 
+     <| os0 with sh = <| os0.sh with traps = Map.delete signal os0.sh.traps |> |>
+  | Just cmd ->
+     <| os0 with sh = <| os0.sh with traps = Map.insert signal cmd os0.sh.traps |> |>
+  end
+
+val clear_traps_for_subshell : shell_state -> shell_state * list signal
+let clear_traps_for_subshell sh =
+  let traps = Map_extra.toList sh.traps in
+  let (ignored,handled) = 
+    partition (fun (_signal,cmd) -> string_of_symbolic_string cmd = "") traps 
+  in
+   (* clear handled traps (but keep ignored ones); record supershell trap info *)
+  (<| sh with traps = Map.fromList ignored;
+              supershell_traps = Just sh.traps |>,
+   (* indicate which handled traps are now cleared *)
+   map fst handled)
+
+val clear_supershell_traps : forall 'a. os_state 'a -> os_state 'a
+let clear_supershell_traps os =
+  <| os with sh = <| os.sh with supershell_traps = Nothing |> |>
+
+val exit_trap : forall 'a. os_state 'a -> os_state 'a * maybe stmt
+let exit_trap s0 =
+  match Map.lookup EXIT s0.sh.traps with
+  | Nothing -> (s0, Nothing)
+  | Just ss_cmd -> (update_trap s0 EXIT Nothing, Just (command_eval ss_cmd))
+  end
+
+(* Returns a shell state that's ready for spawning.
+ * 
+ * Clears traps, resets shell state like loop nesting, etc.
+ *
+ * Returns a list of signals that _were_ handled so they can be set to default actions.
+ *)
+val prepare_subshell : shell_state -> shell_state * list signal
+let prepare_subshell sh0 =
+  let sh1 =
+    <| sh0 with outermost = false;
+                optoff = Nothing;
+                jobs = [];
+                loop_nest = 0
+    |> in
+  clear_traps_for_subshell sh1
+
+
+(* Aliases ************************************************************)
+
+val dash_setalias : string -> string -> unit
+declare ocaml target_rep function dash_setalias = `Dash.setalias`
+
+val dash_unalias : string -> unit
+declare ocaml target_rep function dash_unalias = `Dash.unalias`
+
+val set_alias : forall 'a. os_state 'a -> string -> string -> os_state 'a
+let set_alias os name mapping =
+  let _ = dash_setalias name mapping in
+  <| os with sh = <| os.sh with aliases = Map.insert name mapping os.sh.aliases |> |>
+
+val free_alias : forall 'a. os_state 'a -> string -> os_state 'a
+let free_alias os name =
+  let _ = dash_unalias name in
+  <| os with sh = <| os.sh with aliases = Map.delete name os.sh.aliases |> |>
+
+(**********************************************************************)
+(* FS STATE ***********************************************************)
+(**********************************************************************)
+
+val default_block : nat
+let default_block = 10 (* wait 10 steps by default *)
+
+type read_eof = ReadEOF | ReadContinue
+
+val read_eof : read_eof -> bool
+let read_eof eof =
+  match eof with
+  | ReadEOF -> true
+  | ReadContinue -> false
+  end
+                        
+type read_result 'a =
+    ReadError of string (* bad FD, etc. *)
+  | ReadBlocked of nat (* pid of blocking process; 
+                          only ever used in symbolic mode...
+                          system mode just actually blocks! *)
+  | ReadSuccess of 'a * read_eof
+      
+(* TODO 2018-08-14 file contents? will allow for use of, e.g., /etc/passwd *)
+type file 'a = File | Dir of 'a
+
+type file_type = 
+    FileRegular 
+  | FileDirectory 
+  | FileCharacter
+  | FileBlock
+  | FileLink
+  | FileFIFO
+  | FileSocket
+
+declare ocaml target_rep type file_type = `Unix.file_kind`
+declare ocaml target_rep function FileRegular   = `Unix.S_REG`
+declare ocaml target_rep function FileDirectory = `Unix.S_DIR`
+declare ocaml target_rep function FileCharacter = `Unix.S_CHR`
+declare ocaml target_rep function FileBlock     = `Unix.S_BLK`
+declare ocaml target_rep function FileLink      = `Unix.S_LNK`
+declare ocaml target_rep function FileFIFO      = `Unix.S_FIFO`
+declare ocaml target_rep function FileSocket    = `Unix.S_SOCK`
+
+(**********************************************************************)
+(* OS CLASS ***********************************************************)
+(**********************************************************************)
+
+type step_fun 'a = 
+  os_state 'a -> 
+  checking_mode ->
+  stmt -> 
+  evaluation_step * os_state 'a * stmt
+
+type signal_mode = SignalProcess | SignalProcessGroup
+
+val signal_processgroup : signal_mode -> bool
+let signal_processgroup signal_mode =
+  match signal_mode with
+  | SignalProcess -> false
+  | SignalProcessGroup -> true
+  end
+
+type escape_mode = BackslashEscapes | NoEscapes
+
+val allow_escapes : escape_mode -> bool
+let allow_escapes escape_mode =
+  match escape_mode with
+  | BackslashEscapes -> true
+  | NoEscapes -> false
+  end
+        
+class ( OS 'a )
+  (* FOR SYMBOLIC TRACKING *)
+  val os_tick : os_state 'a -> os_state 'a
+
+  (* PARSER INTERACTIONS *)
+  val os_set_ps1 : os_state 'a -> symbolic_string -> os_state 'a
+  val os_set_ps2 : os_state 'a -> symbolic_string -> os_state 'a
+
+  (* SYSTEM CALLS *)
+  val os_getpwnam : os_state 'a -> string -> maybe string
+
+  val os_execve : 
+    os_state 'a -> 
+    symbolic_string -> (* cmd *)
+    symbolic_string -> (* argv[0] *)
+    list symbolic_string -> (* argv w/o cmd *)
+    env -> 
+    binsh_mode ->
+    os_state 'a * either string stmt
+  val os_fork_and_subshell : 
+    os_state 'a -> 
+    stmt -> 
+    bg_mode -> 
+    maybe pid (* pgrp id *) ->
+    bool (* do job control? *) ->
+    os_state 'a * pid
+  val os_exit : os_state 'a -> os_state 'a
+
+  (* don't call this directly; call wait_for_pid *)
+  val os_waitpid : 
+    step_fun 'a -> (* for opportunistic scheduling in symbolic mode *)
+    os_state 'a -> pid -> 
+    os_state 'a * maybe (either evaluation_step (* step taken *) nat (* exit code *))  
+  val os_waitchild : os_state 'a -> os_state 'a * maybe (pid * job_status)
+
+  val os_handle_signal : os_state 'a -> signal -> maybe symbolic_string -> os_state 'a
+  val os_signal_pid : os_state 'a -> signal -> pid -> signal_mode -> os_state 'a * bool
+  val os_pending_signal : os_state 'a -> os_state 'a * maybe signal
+
+  val os_tc_setfg : os_state 'a -> pid -> os_state 'a * bool
+  val os_set_job_control : os_state 'a -> bool -> os_state 'a
+
+  val os_times : os_state 'a -> 
+              (string (* utime *)            * string (* stime *) * 
+               string (* utime + children *) * string (* stime + children *))
+
+  val os_get_umask : os_state 'a -> perms
+  val os_set_umask : os_state 'a -> perms -> os_state 'a
+
+  (* FS CALLS *)
+
+  val os_physical_cwd : os_state 'a -> string
+  val os_chdir : os_state 'a -> path -> os_state 'a * maybe string
+  val os_readdir : os_state 'a -> path -> set (path * file unit)
+  val os_file_exists : os_state 'a -> path -> bool
+
+  (* stat calls *)
+  val os_file_type : os_state 'a -> path -> maybe file_type
+  (* lstat (follow links) *)
+  val os_file_type_follow : os_state 'a -> path -> maybe file_type
+  val os_file_size : os_state 'a -> path -> maybe nat
+  val os_file_perms : os_state 'a -> path -> maybe perms
+  val os_file_mtime : os_state 'a -> path -> maybe real
+  val os_file_number : os_state 'a -> path -> maybe (int * int)
+  val os_is_tty : os_state 'a -> fd -> bool
+  val os_is_readable : os_state 'a -> path -> bool
+  val os_is_writeable : os_state 'a -> path -> bool
+  val os_is_executable : os_state 'a -> path -> bool
+
+  val os_write_fd : os_state 'a -> fd -> string -> maybe (os_state 'a)
+  val os_read_all_fd : 
+    step_fun 'a -> (* for opportunistic scheduling in symbolic mode *)
+    os_state 'a -> fd -> os_state 'a * either evaluation_step (maybe string)
+  val os_read_line_fd 
+      : os_state 'a -> fd -> escape_mode ->
+        os_state 'a * read_result string
+  val os_close_fd : os_state 'a -> fd -> os_state 'a
+
+  val os_pipe : os_state 'a -> os_state 'a * fd * fd
+
+  val os_open_file_for_redir 
+      : os_state 'a -> redir_type -> symbolic_string -> 
+        os_state 'a * either string fd
+  val os_open_heredoc : os_state 'a -> string -> either string (os_state 'a * fd)
+  val os_close_and_save_fd : os_state 'a -> fd -> os_state 'a * either string saved_fds
+  val os_renumber_fd : os_state 'a -> 
+                    orig_fd_action -> 
+                    fd (* orig *) -> 
+                    fd (* wanted number *) -> 
+                    os_state 'a * either string saved_fds
+  val os_restore_fd : os_state 'a -> fd -> saved_fd_info -> os_state 'a
+end
+
+(* Logging for syscalls ***********************************************)
+  
+(* for -d[...] and -o trace[...]
+
+   this version is useful inside os instances (os_*.lem), which can't
+   recursively use their own typeclass
+
+   we're using it here to just bootstrap some logging
+*)
+val unlogged_write_stderr : forall 'a. OS 'a => string -> os_state 'a -> os_state 'a
+let unlogged_write_stderr s os =
+  match os_write_fd os STDERR s with
+  | Just os' -> os'
+  | Nothing -> os
+  end               
+
+val log_trace : forall 'a. OS 'a => trace_tag -> string -> os_state 'a -> os_state 'a
+let log_trace = log_trace_with unlogged_write_stderr
+
+val log_syscall : forall 'a. OS 'a => string -> os_state 'a -> os_state 'a
+let log_syscall = log_trace Trace_syscall
+
+val wrap_syscall : forall 'a 'b. OS 'a => string -> os_state 'a -> (os_state 'a -> 'b) -> 'b
+let wrap_syscall msg os f = f (log_syscall msg os)
+
+val wrap_syscall_path : forall 'a 'b. OS 'a => string -> path -> os_state 'a -> (os_state 'a -> path -> 'b) -> 'b
+let wrap_syscall_path msg path os f = f (log_syscall (msg ^ "(" ^ path ^ ")") os) path
+
+val wrap_syscall_fd : forall 'a 'b. OS 'a => string -> fd -> os_state 'a -> (os_state 'a -> fd -> 'b) -> 'b
+let wrap_syscall_fd msg fd os f = f (log_syscall (msg ^ "(" ^ stringFromNat fd ^ ")") os) fd
+
+(* Wrapped syscalls ***************************************************) 
+ 
+let tick os =
+  <| (os_tick os) with fuel = Maybe.map (fun n -> if n > 0 then n - 1 else 0) os.fuel |>
+
+let set_ps1 os = wrap_syscall "set_ps1" os os_set_ps1
+let set_ps2 os = wrap_syscall "set_ps2" os os_set_ps2
+
+let getpwnam os user = os_getpwnam (log_syscall ("getpwnam(" ^ user ^ ")") os) user
+
+let execve os cmd = 
+  os_execve (log_syscall ("execve(" ^ string_of_symbolic_string cmd ^ ")") os) cmd
+let fork_and_subshell os = wrap_syscall "fork_and_subshell" os os_fork_and_subshell
+let exit os = wrap_syscall "exit" os os_exit
+
+let waitpid step_fun os pid = 
+  os_waitpid step_fun (log_syscall ("waitpid(" ^ stringFromNat pid ^ ")") os) pid
+let waitchild os = wrap_syscall "waitchild" os os_waitchild
+
+let handle_signal os signal = 
+  os_handle_signal (log_syscall ("handle_signal(" ^ string_of_signal signal ^ ")") os) signal
+let signal_pid os signal pid signal_mode = 
+  let pid_s = (if signal_processgroup signal_mode then "-" else "") ^ stringFromNat pid in
+  let msg = "signal_pid(" ^ string_of_signal signal ^ ", " ^  pid_s ^ ")" in
+  os_signal_pid (log_syscall msg os) signal pid signal_mode
+let pending_signal os = wrap_syscall "pending_signal" os os_pending_signal
+
+let tc_setfg os pid = 
+  os_tc_setfg (log_syscall ("tc_setfg(" ^ stringFromNat pid ^ ")") os) pid
+let set_job_control os on = 
+  let msg = "set_job_control(" ^ if on then "on" else "off" ^ ")" in
+  os_set_job_control (log_syscall msg os) on
+
+val times : forall 'a. OS 'a => os_state 'a -> 
+               (string (* utime *)            * string (* stime *) * 
+                string (* utime + children *) * string (* stime + children *))
+let times os = wrap_syscall "times" os os_times
+
+let get_umask os = wrap_syscall "get_umask" os os_get_umask
+let set_umask os = wrap_syscall "set_umask" os os_set_umask
+
+let physical_cwd os = wrap_syscall "physical_cwd" os os_physical_cwd
+let chdir os path = wrap_syscall_path "chdir" path os os_chdir
+
+val readdir : forall 'a. OS 'a => os_state 'a -> path -> set (path * file unit)
+let readdir os path = wrap_syscall_path "readdir" path os os_readdir
+
+let file_exists os path = wrap_syscall_path "file_exists" path os os_file_exists
+let file_type os path = wrap_syscall_path "file_type" path os os_file_type
+let file_type_follow os path = 
+  wrap_syscall_path "file_type_follow" path os os_file_type_follow
+let file_size os path = wrap_syscall_path "file_size" path os os_file_size
+let file_perms os path = wrap_syscall_path "file_perms" path os os_file_perms
+let is_readable os path = wrap_syscall_path "is_readable" path os os_is_readable
+let is_writeable os path = wrap_syscall_path "is_writeable" path os os_is_writeable
+let is_executable os path = wrap_syscall_path "is_executable" path os os_is_executable
+
+let file_mtime os path  = wrap_syscall_path "file_mtime" path os os_file_mtime
+let file_number os path  = wrap_syscall_path "file_number" path os os_file_number
+
+let is_tty os fd = wrap_syscall_fd "is_tty" fd os os_is_tty
+let write_fd os fd = wrap_syscall_fd "write_fd" fd os os_write_fd
+let read_all_fd step_fun os fd = 
+  wrap_syscall_fd "read_all_fd" fd os (fun os -> os_read_all_fd step_fun os)
+let read_line_fd os fd = wrap_syscall_fd "read_line_fd" fd os os_read_line_fd 
+let close_fd os fd = wrap_syscall_fd "close_fd" fd os os_close_fd
+
+let pipe os = wrap_syscall "pipe" os os_pipe
+let open_file_for_redir os redir_type spath = 
+  let msg = "open_file_for_redir(" ^ string_of_symbolic_string spath ^ ")" in
+  os_open_file_for_redir (log_syscall msg os) redir_type spath
+
+let open_heredoc os = wrap_syscall "open_heredoc" os os_open_heredoc
+let close_and_save_fd os fd = 
+    wrap_syscall_fd "close_and_save_fd" fd os os_close_and_save_fd
+let renumber_fd os action orig_fd wanted_fd = 
+  let msg = "renumber_fd(" ^ stringFromNat orig_fd ^ ", " ^ stringFromNat wanted_fd ^ ")" in
+  os_renumber_fd (log_syscall msg os) action orig_fd wanted_fd
+let restore_fd os fd = wrap_syscall_fd "restore_fd" fd os os_restore_fd
+   
+(**********************************************************************)
+(* SHELL/OS STATE FUNCTIONS *******************************************)
+(**********************************************************************)
+
+(* Reading and writing FDs ********************************************)
+
+val try_write_fd : forall 'a. OS 'a => fd -> string -> os_state 'a -> os_state 'a * bool
+let try_write_fd fd s os =
+  (* TODO 2018-03-02 is this the right behavior when an fd points to a bad fifo, e.g., STDERR is closed? *)
+  match write_fd os fd s with
+  | Just os' -> (os', true)
+  | Nothing -> (os, false)
+  end
+   
+val write_stdout : forall 'a. OS 'a => string -> os_state 'a -> os_state 'a
+let write_stdout msg os = fst (try_write_fd STDOUT msg os)
+
+val write_stderr : forall 'a. OS 'a => string -> os_state 'a -> os_state 'a
+let write_stderr msg os = fst (try_write_fd STDERR msg os)
+
+val fail_with_code : forall 'a. OS 'a => nat -> string -> os_state 'a -> os_state 'a
+let fail_with_code ec msg os = exit_with ec (write_stderr (msg ^ "\n") os)
+    
+val fail_with : forall 'a. OS 'a => string -> os_state 'a -> os_state 'a
+let fail_with = fail_with_code 1
+
+val safe_write_stdout : forall 'a. OS 'a => string -> string -> os_state 'a -> os_state 'a
+let safe_write_stdout writer msg os = 
+  let (os', ok) = try_write_fd STDOUT msg os in
+  if not ok
+  then fail_with_code 2 ("smoosh: " ^ writer ^ ": I/O error") os'
+  else os'
+
+val safe_write_stderr : forall 'a. OS 'a => string -> os_state 'a -> os_state 'a
+let safe_write_stderr msg os = 
+  let (os', ok) = try_write_fd STDERR msg os in
+  if not ok
+  then exit_with 2 os' (* no need to even try printing a message :( *)
+  else os'
+             
+(* FS and path manipulation *******************************************)
+
+val is_dir : forall 'a. OS 'a => os_state 'a -> path -> bool
+let is_dir os path = file_type os path = Just FileDirectory
+
+val canonicalize_split_path : forall 'a. OS 'a => os_state 'a -> path -> list string -> maybe string
+let rec canonicalize_split_path os path components =
+  match components with
+  | [] -> Just path
+  | ""::components' -> canonicalize_split_path os path components' (* result of // *)
+  | "."::components' -> canonicalize_split_path os path components'
+  | ".."::components' -> 
+     if is_dir os path
+     then canonicalize_split_path os (dotdot path) components'
+     else Nothing
+  | dir::components' -> canonicalize_split_path os (join_path path dir) components'
+  end
+
+val canonicalize_path : forall 'a. OS 'a => os_state 'a -> path -> maybe path 
+let canonicalize_path os path = 
+  let (initial,path') =
+    match (toCharList path) with
+    | #'/'::#'/'::path' -> 
+       ("//",toString path') (* save initial double slash---the rest will go *)
+    | #'/'::path' -> ("/",toString path')
+    | _ -> ("/",path)
+    end
+  in
+  let components = split_string_on false (* not escapable *) #'/' path' in
+  canonicalize_split_path os initial components
+
+(* Job control ********************************************************)  
+
+val show_job : forall 'a. OS 'a => jobs_mode -> pid * pid -> job_info -> os_state 'a -> os_state 'a
+let show_job mode curjob job os0 =
+  safe_write_stdout "jobs" (string_of_job mode curjob job) os0
+
+val show_job_when : forall 'a. OS 'a => sh_opt -> jobs_mode -> pid * pid -> job_info -> os_state 'a -> os_state 'a
+let show_job_when opt mode curjob job os0 =
+  if Set.member opt os0.sh.opts
+  then 
+    let os1 = 
+      if opt = Sh_notify 
+      then 
+        (* asyncronous, so make sure we add a newline *)
+        write_stderr "\n" os0
+      else os0
+    in
+    write_stderr (string_of_job mode curjob job) os1
+  else os0
+
+val active_jobs : forall 'a. OS 'a => os_state 'a -> os_state 'a * list job_info
+let active_jobs os0 =
+  let real_jobs = List.filter is_active_job os0.sh.jobs in
+  (* TODO 2018-10-02 check jobs more seriously? *)
+  (* TODO 2018-10-02 announce completed jobs? *)
+  (<| os0 with sh = <| os0.sh with jobs = real_jobs |> |>, 
+   real_jobs)
+
+(* TODO 2019-05-10 will use stdout when no option given, stderr otherwise *)
+val show_jobs : forall 'a. OS 'a => maybe sh_opt -> jobs_mode -> nat * nat -> list job_info -> os_state 'a -> os_state 'a
+let show_jobs mopt mode cur_prev jobs s0 =
+  let show =
+    match mopt with
+    | Nothing -> show_job
+    | Just opt -> show_job_when opt
+    end
+  in
+  foldl (fun os job -> show mode cur_prev job os) s0 (sort jobs)
+
+type jobs_update_mode = DeleteJobs | NoDeleteJobs
+
+let delete_jobs jum =
+  match jum with
+  | DeleteJobs -> true
+  | NoDeleteJobs -> false
+  end
+
+(* helper for the interactive shell in -m and -b; used in EvalLoop
+
+   this is all a recursive loop because add_job needs to
+   show_changed_jobs and show_changed_jobs needs to update_jobs and
+   update_jobs needs to add_job *)
+val show_changed_jobs : forall 'a. OS 'a => jobs_update_mode -> sh_opt -> os_state 'a -> os_state 'a
+val add_job 
+    : forall 'a. OS 'a =>
+        os_state 'a ->
+        list (pid * stmt) -> pid -> stmt (* cmd *) -> bg_mode -> job_status ->
+        os_state 'a * job_info
+val update_job_with_pid : forall 'a. OS 'a => os_state 'a -> nat -> job_status -> os_state 'a * maybe job_info
+val update_jobs_loop : forall 'a. OS 'a => os_state 'a -> list job_info -> os_state 'a * list job_info
+val update_jobs : forall 'a. OS 'a => os_state 'a -> os_state 'a * list job_info (* changed *)
+
+let rec show_changed_jobs jum opt s0 =
+  let (s1,changed) = update_jobs s0 in
+  let s2 = show_jobs (Just opt) JobsNormal (cur_prev_jobs s1.sh.jobs) changed s1 in
+  if Set.member opt s0.sh.opts && delete_jobs jum 
+  then List.foldl (fun os j -> delete_job os j.id) s2 changed
+  else s2
+
+and add_job os0 pipeline pid cmd bg_mode status =
+  let os1 = show_changed_jobs NoDeleteJobs Sh_monitor os0 in
+  let highest_job_num = 
+    match os1.sh.jobs with
+    | [] -> 0
+    | _ -> maximum (map (fun job -> job.id) os1.sh.jobs)
+    end in
+  let new_job = 
+    <| id = highest_job_num + 1;
+       pid = pid;
+       cmd = cmd;
+       status = status;
+       pipeline = pipeline;
+    |>
+  in
+  let os2 =
+    if is_monitoring os1 && is_bg bg_mode && is_active_job new_job
+    then 
+      let msg = "[" ^ stringFromNat new_job.id ^ "] " ^ string_of_pid pid ^ "\n" in
+      write_stdout msg os1 
+    else os1
+  in
+  (<| os2 with sh = <| os1.sh with jobs = new_job::os1.sh.jobs |> |>, new_job)
+
+and update_job_with_pid os0 pid new_status =
+  match List.find (fun j -> j.pid = pid) os0.sh.jobs with
+  | Nothing ->
+     (* must be a sub-child... the following is more or less dead code.
+        TODO 2019-06-12 what is really going on here?
+      *)
+     let pid_in_pipeline pid j =
+       match List.find (fun (pid',_) -> pid = pid') j.pipeline with
+       | Nothing -> false
+       | Just _ -> true
+       end
+     in
+     match List.find (pid_in_pipeline pid) os0.sh.jobs with
+     | Nothing -> 
+        (* no such job... weird! get a fake job, which we'll immediately trash if we can *)
+(*        let (os1, job) = add_job os0 [(pid,skip)] pid skip BG new_status in
+        let os2 = delete_job os1 job.id in *)
+        (os0, Nothing)
+     | Just _parent -> (os0, Nothing)
+     end
+  | Just job -> (* update the job status! *)
+     let job' = <| job with status = new_status |> in
+     let cur_jobs = map (fun j -> if j.id = job'.id then job' else j) os0.sh.jobs in
+     let os1 = <| os0 with sh = <| os0.sh with jobs = cur_jobs |> |> in
+     let os2 = show_job_when Sh_notify JobsNormal (cur_prev_jobs os1.sh.jobs) job' os1 in
+     (os2, Just job')
+  end
+
+and update_jobs_loop os0 changes =
+  match waitchild os0 with
+  | (os1, Nothing) -> (os1, changes)
+  | (os1, Just (pid, status)) ->
+     let (os2, m_job') = update_job_with_pid os1 pid status in
+     let changes' =
+       match m_job' with
+       | Nothing -> changes
+       | Just job' -> job'::changes
+       end
+     in
+     update_jobs_loop os2 changes'
+  end
+
+and update_jobs os0 = update_jobs_loop os0 []
+
+let waitpid_or_lookup step_eval os0 pid =
+  match waitpid step_eval os0 pid with
+  | (os1, Nothing) ->
+     (* got ECHILD... so let's consult our job table *)
+     match find_job_with_pid os1 pid with
+     | Nothing -> (os1, Nothing)
+     | Just job -> 
+        match ec_of_job_status job.status with
+        | Nothing -> (os1, Nothing)
+        | Just code -> 
+           let os2 = delete_job os1 job.id in
+           (os2, Just (Right code))
+        end
+     end
+  | (os1, Just (Left step)) -> (os1, Just (Left step))
+  | (os1, Just (Right code)) -> 
+     let status = job_status_of_ec code in
+     let (os2, m_job) = update_job_with_pid os1 pid status in
+     let os3 =
+       match (m_job, status) with
+       | (Just job, JobStopped _) -> 
+          if Set.member Sh_monitor os2.sh.opts 
+          then show_job JobsNormal (cur_prev_jobs os1.sh.jobs) job (write_stderr "\n" os2)
+          else os2
+       | _ -> os2
+       end
+     in
+     (os3, Just (Right code))
+  end
+
+(* We need to:
+   (a) make sure everything in the job is done, and
+   (b) return the exit code of the pid we care about *)
+val wait_for_job : forall 'a. OS 'a =>     
+    step_fun 'a -> (* for opportunistic scheduling in symbolic mode *)
+    os_state 'a -> job_info -> pipeline_info -> pid -> maybe nat (* collected exit code *) ->
+    os_state 'a * maybe (either evaluation_step (* step taken *) nat (* exit code *))  
+let rec wait_for_job step_eval os0 job pipeline tgt_pid mec =
+  match pipeline with
+  | [] ->
+     match mec with
+     | Nothing -> waitpid_or_lookup step_eval os0 tgt_pid
+     | Just ec -> (os0, Just (Right ec))
+     end
+  | (pid,_)::pipeline' -> 
+     match waitpid_or_lookup step_eval os0 pid with
+     | (os1, Nothing) -> (os1, Nothing)
+     | (os1, Just (Left step)) -> (os1, Just (Left step))
+     | (os1, Just (Right ec)) ->
+        wait_for_job step_eval os1
+          job pipeline' tgt_pid (if pid = tgt_pid then Just ec else mec)
+     end
+  end
+
+val wait_for_pid : forall 'a. OS 'a =>     
+    step_fun 'a -> (* for opportunistic scheduling in symbolic mode *)
+    os_state 'a -> pid -> 
+    os_state 'a * maybe (either evaluation_step (* step taken *) nat (* exit code *))  
+let wait_for_pid step_eval os0 pid =
+  match find_job_with_pid os0 pid with
+  | Nothing -> waitpid_or_lookup step_eval os0 pid
+  | Just job -> 
+     (* we reverse the pipeline so that we wait for the final job in
+        the pipeline _first_.
+
+        this gives us a better schedule in symbolic mode
+
+        it shouldn't matter at all in system mode *)
+     wait_for_job step_eval os0 job (reverse job.pipeline) pid Nothing
+  end
+
+(* Redirects **********************************************************)
+
+val redirect : forall 'a. OS 'a => os_state 'a -> expanded_redir -> 
+               os_state 'a * either string saved_fds
+let redirect os0 er =
+  match er with
+  | ERFile ty wanted_fd sfile -> 
+     match open_file_for_redir os0 ty sfile with
+     | (os1, Left err) -> (os1, Left err)
+     | (os1, Right new_fd) -> renumber_fd os1 CloseOrig new_fd wanted_fd
+     end
+  | ERDup _ty _close_orig orig_fd Nothing ->
+     (* we're meant to close orig_fd *)
+     close_and_save_fd os0 orig_fd
+  | ERDup _ty close_orig orig_fd (Just wanted_fd) ->
+     (* dash doesn't distinguish between the two types... because
+        both resolve to the same dup2 call, since dup2 doesn't care
+        about fd direction *)
+     renumber_fd os0 close_orig wanted_fd orig_fd
+  | ERHeredoc _ty wanted_fd ss -> 
+     (* ty is irrelevant at this point---we used it to determine the
+        kinds of expansion we'll go through *)
+     let (os1,_concretized,s) = concretize os0 ss in
+     match open_heredoc os1 s with
+     | Left err -> (os1, Left err)
+     | Right (os2, new_fd) -> renumber_fd os2 CloseOrig new_fd wanted_fd
+     end
+  end
+
+val restore_fds : forall 'a. OS 'a => os_state 'a -> saved_fds -> os_state 'a
+let restore_fds os saved_fds =
+  foldr
+    (fun (orig_fd, info) os' -> restore_fd os' orig_fd info)
+    os
+    saved_fds 
+
+let rec really_do_redirs os0 ers =
+  match ers with
+  | [] -> (os0, Right [])
+  | (er::ers') ->
+     match redirect os0 er with
+     | (os1, Left err) -> (os1, Left err)
+     | (os1, Right saved) -> 
+        match really_do_redirs os1 ers' with
+        | (os2, Left err) -> (os2, Left err)
+        | (os2, Right saved') -> (os2, Right (saved ++ saved'))
+        end
+     end
+  end
+
+val do_redirs : forall 'a. OS 'a => os_state 'a -> list expanded_redir -> 
+                os_state 'a * either string saved_fds
+let do_redirs os0 ers =
+  if Set.member Sh_noexec os0.sh.opts
+  then (os0, Right [])
+  else really_do_redirs os0 ers
+
+(* Pipes **************************************************************)
+
+val fork_pipe_subshell : forall 'a. OS 'a =>
+                 os_state 'a ->
+                 stmt -> (* actual stmt *)
+                 bg_mode -> (* bg? [for tty] *)
+                 maybe pid -> (* pipeline pgrp *)
+                 bool -> (* last job? *)
+                 pipeline_info ->
+                 os_state 'a * pipeline_info * pid
+let fork_pipe_subshell s0 stmt bg pgid last pipeline =
+  let (s1, pid) = fork_and_subshell s0 stmt bg pgid last in
+(*  let s2 =
+    if last && is_fg bg
+    then fst (tc_setfg s1 pid)
+    else s1
+  in *)
+  (s1, pipeline, pid)
+
+val run_pipe_loop : forall 'a. OS 'a =>
+                 os_state 'a ->
+                 list stmt -> 
+                 fd ->
+                 bg_mode -> (* bg? [for tty] *)
+                 maybe pid -> (* pipeline pgrp *)
+                 pipeline_info ->
+                 os_state 'a * pipeline_info * pid
+let rec run_pipe_loop s0 stmts fd_prev bg pgid pipeline =
+  match stmts with
+  | [] -> fork_pipe_subshell s0 Done bg pgid true pipeline (* just run a trivial statement *)
+  | [stmt] -> (* last one *)
+     let (s1, pipeline', last_pid) = 
+       fork_pipe_subshell 
+         s0 
+         (with_redirs 
+            (try_avoid_fork stmt)
+            [ERDup ToFD CloseOrig STDIN (Just fd_prev)])
+         bg
+         pgid
+         true (* last job *)
+         pipeline
+     in
+     let s2 = close_fd s1 fd_prev in
+     (s2, reverse ((last_pid,stmt)::pipeline'), last_pid)
+  | stmt::stmts' ->
+     let (s1, fd_next, fd_write) = pipe s0 in
+     let (s2, pipeline', pid) =
+       fork_pipe_subshell 
+         s1
+         (with_redirs 
+            (close_fd_and_then fd_next stmt) 
+            [ERDup ToFD CloseOrig STDIN (Just fd_prev)
+            ;ERDup ToFD CloseOrig STDOUT (Just fd_write)])
+         bg
+         pgid
+         false (* not last job *)
+         pipeline
+     in
+     let s3 = close_fd s2 fd_prev in
+     let s4 = close_fd s3 fd_write in
+     run_pipe_loop s4 stmts' fd_next bg pgid ((pid,stmt)::pipeline')
+  end
+
+val run_pipe : forall 'a. OS 'a =>
+                 os_state 'a ->
+                 list stmt ->
+                 bg_mode -> (* bg? [for tty] *)
+                 os_state 'a * pipeline_info * pid
+let run_pipe s0 stmts bg =
+  match stmts with
+  | [] -> fork_pipe_subshell s0 Done bg Nothing true []     (* just run a trivial statement *)
+  | [stmt] -> fork_pipe_subshell s0 stmt bg Nothing true [] (* trivial pipe *)
+  | stmt::stmts' ->                                         (* real pipe! *)
+     (* set up first process *)
+     let (s1, fd_next, fd_write) = pipe s0 in
+     let (s2, pipeline, pid) =
+       fork_pipe_subshell
+         s1
+         (with_redirs 
+            (close_fd_and_then fd_next stmt)
+            [ERDup ToFD CloseOrig STDOUT (Just fd_write)]) 
+         bg
+         Nothing
+         false (* not last job *)
+         []
+     in
+     let s3 = close_fd s2 fd_write in
+     (* hand off to the loop *)
+     run_pipe_loop s3 stmts' fd_next bg (Just pid) ((pid,stmt)::pipeline)
+  end
+
+(* Parameters and the environment *************************************)
+
+(* for xtrace *)
+val xtrace : forall 'a. OS 'a => string -> os_state 'a -> os_state 'a
+let xtrace msg os =
+  if Set.member Sh_xtrace os.sh.opts && msg <> ""
+  then write_stderr (ps4 os ^ msg ^ "\n") os
+  else os
+  
+val checked_set_param : forall 'a. OS 'a =>
+                  string -> symbolic_string -> os_state 'a -> os_state 'a
+let checked_set_param x v os0 =
+  let os1 = internal_set_param x v os0 in
+  let os2 = 
+    (* TODO 2019-06-07 what does this do with locals? 
+       bash exports, dash does not
+     *)
+    if Set.member Sh_allexport os1.sh.opts 
+    then <| os1 with sh = <| os1.sh with export = Set.insert x os1.sh.export |> |>
+    else os1
+  in
+  (* special variable handling for the parser and other internals *)
+  if x = "OPTIND" 
+  then <| os2 with sh = <| os2.sh with optoff = Nothing |> |>
+  else if x = "PS1"
+  then set_ps1 os2 v
+  else if x = "PS2"
+  then set_ps2 os2 v
+  else if x = "PATH"
+  then clear_hash os2
+  else os2
+
+val set_param : forall 'a. OS 'a =>
+                  string -> symbolic_string -> os_state 'a -> either string (os_state 'a)
+let set_param x v os0 =
+  match check_param x os0 with
+  | Just err -> Left err
+  | Nothing -> Right (checked_set_param x v os0)
+  end
+                                  
+(* Shell options ******************************************************)
+
+val set_sh_opt : forall 'a. OS 'a => os_state 'a -> sh_opt -> os_state 'a
+let set_sh_opt os0 opt =
+  let os1 = 
+    if List.elem opt unimplemented_sh_opts
+    then write_stderr ("set: warning: " ^ string_of_sh_opt opt ^ " is unimplemented\n") os0 
+    else os0
+  in
+  let os2 = 
+    if opt = Sh_monitor
+    then
+      (* If the -m option is in effect, SIGTTIN, SIGTTOU, and SIGTSTP
+         signals shall be ignored. *)
+      let os2 = set_job_control os1 true in
+      let os3 = handle_signal os2 SIGTTOU (Just []) in
+      let os4 = handle_signal os3 SIGTTIN (Just []) in
+      let os5 = handle_signal os4 SIGTSTP (Just []) in
+      os5
+    else os1
+  in
+  <| os2 with sh = <| os2.sh with opts = Set.insert opt os2.sh.opts |> |>
+
+val unset_sh_opt : forall 'a. OS 'a => os_state 'a -> sh_opt -> os_state 'a
+let unset_sh_opt os0 opt =
+  let os1 =
+    if opt = Sh_monitor
+    then
+      let os1 = set_job_control os0 false in
+      let os2 = handle_signal os1 SIGTTOU Nothing in
+      let os3 = handle_signal os2 SIGTTIN Nothing in
+      let os4 = handle_signal os3 SIGTSTP Nothing in
+      os4
+    else os0
+  in
+  <| os1 with sh = <| os1.sh with opts = Set.delete opt os1.sh.opts |> |>
+

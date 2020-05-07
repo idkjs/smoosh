@@ -1,0 +1,656 @@
+(*
+ * Parse and evaluate a string representing the arithmetic operation
+ *)
+open import Smoosh_num
+open import Smoosh
+
+type arith_token 'a =
+    TNum of 'a
+  | TVar of string
+  | TPlus | TMinus
+  | TTimes | TDiv | TMod
+  | TBitNot | TBoolNot (* Is '!' actually allowed? *)
+  | TLShift | TRShift
+  | TLt | TLte
+  | TGt | TGte
+  | TEq | TNEq
+  | TBitAnd | TBitOr | TBitXOr
+  | TBoolAnd | TBoolOr
+  | TQuestion | TColon (* For 1 ? 17 : 18 *)
+  | TVarEq
+  | TVarPlusEq | TVarMinusEq
+  | TVarTimesEq | TVarDivEq | TVarModEq
+  | TVarLShiftEq | TVarRShiftEq
+  | TVarBitAndEq | TVarBitOrEq | TVarBitXOrEq
+  | TLParen | TRParen
+
+val tokenEqual : forall 'a. Eq 'a => arith_token 'a -> arith_token 'a -> bool
+let rec tokenEqual t1 t2 =
+  match (t1, t2) with
+  | (TNum n1, TNum n2) -> n1 = n2
+  | (TVar x1, TVar x2) -> x1 = x2
+  | (TPlus, TPlus) -> true
+  | (TMinus, TMinus) -> true
+  | (TTimes, TTimes) -> true
+  | (TDiv, TDiv) -> true
+  | (TMod, TMod) -> true
+  | (TBitNot, TBitNot) -> true
+  | (TBoolNot, TBoolNot) -> true
+  | (TLShift, TLShift) -> true
+  | (TRShift, TRShift) -> true
+  | (TLt, TLt) -> true
+  | (TLte, TLte) -> true
+  | (TGt, TGt) -> true
+  | (TGte, TGte) -> true
+  | (TEq, TEq) -> true
+  | (TNEq, TNEq) -> true
+  | (TBitAnd, TBitAnd) -> true
+  | (TBitOr, TBitOr) -> true
+  | (TBitXOr, TBitXOr) -> true
+  | (TBoolAnd, TBoolAnd) -> true
+  | (TBoolOr, TBoolOr) -> true
+  | (TQuestion, TQuestion) -> true
+  | (TColon, TColon) -> true
+  | (TVarEq, TVarEq) -> true
+  | (TVarPlusEq, TVarPlusEq) -> true
+  | (TVarMinusEq, TVarMinusEq) -> true
+  | (TVarTimesEq, TVarTimesEq) -> true
+  | (TVarDivEq, TVarDivEq) -> true
+  | (TVarModEq, TVarModEq) -> true
+  | (TVarLShiftEq, TVarLShiftEq) -> true
+  | (TVarRShiftEq, TVarRShiftEq) -> true
+  | (TVarBitAndEq, TVarBitAndEq) -> true
+  | (TVarBitOrEq, TVarBitOrEq) -> true
+  | (TVarBitXOrEq, TVarBitXOrEq) -> true
+  | (TLParen, TLParen) -> true
+  | (TRParen, TRParen) -> true
+  | _ -> false
+  end
+
+instance forall 'a. Eq 'a => (Eq (arith_token 'a))
+  let (=) = tokenEqual
+  let (<>) x y = not (tokenEqual x y)
+end            
+
+val eq_token_integer : arith_token integer -> arith_token integer -> bool
+let eq_token_integer t1 t2 = t1 = t2
+                  
+type BinaryOperator =
+    Plus
+  | Minus
+  | Times
+  | Div
+  | Mod
+  | LShift
+  | RShift
+  | Lt
+  | Lte
+  | Gt
+  | Gte
+  | Eq
+  | NEq
+  | BitAnd
+  | BitOr
+  | BitXOr
+  | BoolAnd
+  | BoolOr
+
+type arith_exp 'a =
+    Num of 'a
+  | Var of string
+  | Neg of arith_exp 'a
+  | BitNot of arith_exp 'a
+  | BoolNot of arith_exp 'a
+  | Conditional of arith_exp 'a * arith_exp 'a * arith_exp 'a
+  | BinOp of BinaryOperator * arith_exp 'a * arith_exp 'a
+  | AssignVar of string * (maybe BinaryOperator) * arith_exp 'a
+
+val arithEqual : forall 'a. Eq 'a => arith_exp 'a -> arith_exp 'a -> bool
+let rec arithEqual a1 a2 =
+  match (a1, a2) with
+  | (Num n1, Num n2) -> n1 = n2
+  | (Var x1, Var x2) -> x1 = x2
+  | (Neg a1', Neg a2') -> arithEqual a1' a2'
+  | (BitNot a1', BitNot a2') -> arithEqual a1' a2'
+  | (BoolNot a1', BoolNot a2') -> arithEqual a1' a2'
+  | (Conditional a11 a12 a13, Conditional a21 a22 a23) ->
+     arithEqual a11 a21 &&
+     arithEqual a12 a22 &&
+     arithEqual a13 a23 
+  | (BinOp op1 a11 a12, BinOp op2 a21 a22) ->
+     arithEqual a11 a21 &&
+     arithEqual a12 a22 &&
+     op1 = op2
+  | (AssignVar x1 op1 a1', AssignVar x2 op2 a2') ->
+     x1 = x2 && op1 = op2 && arithEqual a1' a2'
+  | _ -> false
+  end
+
+instance forall 'a. Eq 'a => (Eq (arith_exp 'a))
+  let (=) = arithEqual
+  let (<>) x y = not (arithEqual x y)
+end            
+
+val eq_arith_integer : arith_exp integer -> arith_exp integer -> bool
+let eq_arith_integer t1 t2 = t1 = t2
+               
+val lexer : forall 'a. Read 'a => (list char) -> either string (list (arith_token 'a))
+val span : (char -> bool) -> (list char) -> ((list char) * list char)
+
+val either_fmap : forall 'a 'b. ('a -> 'b) -> either string 'a -> either string 'b
+let either_fmap fn a = Either.either (fun e -> Left e) (fun b -> Right (fn b)) a
+
+val either_monad : forall 'a 'b 'c. ('a -> either 'b 'c) -> either 'b 'a -> either 'b 'c
+let either_monad fn a = Either.either (fun e -> Left e) fn a
+
+let is_plus c =
+  match c with
+  | #'+' -> true
+  | _ -> false
+  end
+
+let rec span f l =
+  match l with
+  | [] -> ([],[])
+  | c::cs ->
+      if f c
+      then let (s, rst) = span f cs
+           in (c::s, rst)
+      else ([], c::cs)
+  end
+
+let rec lexer str =
+  match str with
+  | [] -> Right []
+  | (#'^'::#'='::cs) -> either_fmap (fun lst -> TVarBitXOrEq::lst) (lexer cs)
+  | (#'|'::#'='::cs) -> either_fmap (fun lst -> TVarBitOrEq::lst) (lexer cs)
+  | (#'&'::#'='::cs) -> either_fmap (fun lst -> TVarBitAndEq::lst) (lexer cs)
+  | (#'>'::#'>'::#'='::cs) -> either_fmap (fun lst -> TVarRShiftEq::lst) (lexer cs)
+  | (#'<'::#'<'::#'='::cs) -> either_fmap (fun lst -> TVarLShiftEq::lst) (lexer cs)
+  | (#'%'::#'='::cs) -> either_fmap (fun lst -> TVarModEq::lst) (lexer cs)
+  | (#'/'::#'='::cs) -> either_fmap (fun lst -> TVarDivEq::lst) (lexer cs)
+  | (#'*'::#'='::cs) -> either_fmap (fun lst -> TVarTimesEq::lst) (lexer cs)
+  | (#'-'::#'='::cs) -> either_fmap (fun lst -> TVarMinusEq::lst) (lexer cs)
+  | (#'+'::#'='::cs) -> either_fmap (fun lst -> TVarPlusEq::lst) (lexer cs)
+  | (#'='::#'='::cs) -> either_fmap (fun lst -> TEq::lst) (lexer cs)
+  | (#'!'::#'='::cs) -> either_fmap (fun lst -> TNEq::lst) (lexer cs)
+  | (#'>'::#'>'::cs) -> either_fmap (fun lst -> TRShift::lst) (lexer cs)
+  | (#'<'::#'<'::cs) -> either_fmap (fun lst -> TLShift::lst) (lexer cs)
+  | (#'&'::#'&'::cs) -> either_fmap (fun lst -> TBoolAnd::lst) (lexer cs)
+  | (#'|'::#'|'::cs) -> either_fmap (fun lst -> TBoolOr::lst) (lexer cs)
+  | (#'='::cs) -> either_fmap (fun lst -> TVarEq::lst) (lexer cs)
+  | (#':'::cs) -> either_fmap (fun lst -> TColon::lst) (lexer cs)
+  | (#'?'::cs) -> either_fmap (fun lst -> TQuestion::lst) (lexer cs)
+  | (#'^'::cs) -> either_fmap (fun lst -> TBitXOr::lst) (lexer cs)
+  | (#'|'::cs) -> either_fmap (fun lst -> TBitOr::lst) (lexer cs)
+  | (#'&'::cs) -> either_fmap (fun lst -> TBitAnd::lst) (lexer cs)
+  | (#'>'::#'='::cs) -> either_fmap (fun lst -> TGte::lst) (lexer cs)
+  | (#'<'::#'='::cs) -> either_fmap (fun lst -> TLte::lst) (lexer cs)
+  | (#'>'::cs) -> either_fmap (fun lst -> TGt::lst) (lexer cs)
+  | (#'<'::cs) -> either_fmap (fun lst -> TLt::lst) (lexer cs)
+  | (#'!'::cs) -> either_fmap (fun lst -> TBoolNot::lst) (lexer cs)
+  | (#'~'::cs) -> either_fmap (fun lst -> TBitNot::lst) (lexer cs)
+  | (#'%'::cs) -> either_fmap (fun lst -> TMod::lst) (lexer cs)
+  | (#'/'::cs) -> either_fmap (fun lst -> TDiv::lst) (lexer cs)
+  | (#'*'::cs) -> either_fmap (fun lst -> TTimes::lst) (lexer cs)
+  | (#'-'::cs) -> either_fmap (fun lst -> TMinus::lst) (lexer cs)
+  | (#'+'::cs) -> either_fmap (fun lst -> TPlus::lst) (lexer cs)
+  | (#'('::cs) -> either_fmap (fun lst -> TLParen::lst) (lexer cs)
+  | (#')'::cs) -> either_fmap (fun lst -> TRParen::lst) (lexer cs)
+  | (c::cs) ->
+      match (is_digit c, is_variable_initial_char c) with
+      | (true, _) -> let (digits, rst) = span is_num_const_char cs in
+                     match read (c::digits) with
+                     | Right n -> either_fmap (fun lst -> (TNum n)::lst) (lexer rst)
+                     | Left e -> Left e
+                     end
+      | (_, true) -> let (var, rst) = span is_variable_char cs
+                     in either_fmap (fun lst -> (TVar (toString (c::var)))::lst) (lexer rst)
+      | (false, false) ->
+          if is_whitespace c
+          then lexer cs
+          else Left ((toString [c]) ^ " is an unrecognized character")
+      end
+  end
+
+val lexer_integer : (list char) -> either string (list (arith_token integer))
+let lexer_integer cs = lexer cs
+
+val parse_assignment : forall 'a. (list (arith_token 'a)) -> either string ((arith_exp 'a) * list (arith_token 'a))
+
+val parse_bit_shift : forall 'a. (list (arith_token 'a)) -> either string ((arith_exp 'a) * list (arith_token 'a))
+val shift_term : forall 'a. (arith_exp 'a) -> (list (arith_token 'a)) -> either string ((arith_exp 'a) * list (arith_token 'a))
+val collect_shift : forall 'a. ((arith_exp 'a) -> (arith_exp 'a)) -> (list (arith_token 'a)) -> either string ((arith_exp 'a) * list (arith_token 'a))
+
+val parse_additive : forall 'a. (list (arith_token 'a)) -> either string ((arith_exp 'a) * list (arith_token 'a))
+val additive_term : forall 'a. (arith_exp 'a) -> (list (arith_token 'a)) -> either string ((arith_exp 'a) * list (arith_token 'a))
+val collect_additive : forall 'a. ((arith_exp 'a) -> (arith_exp 'a)) -> (list (arith_token 'a)) -> either string ((arith_exp 'a) * list (arith_token 'a))
+
+val parse_multiplicative : forall 'a. (list (arith_token 'a)) -> either string ((arith_exp 'a) * list (arith_token 'a))
+val multiplicative_term : forall 'a. (arith_exp 'a) -> (list (arith_token 'a)) -> either string ((arith_exp 'a) * list (arith_token 'a))
+val collect_multiplicative : forall 'a. ((arith_exp 'a) -> (arith_exp 'a)) -> (list (arith_token 'a)) -> either string ((arith_exp 'a) * list (arith_token 'a))
+
+let rec parse_assignment tkns =
+  match tkns with
+  | ((TVar s)::TVarEq::rst) -> collect_assignment (AssignVar s Nothing) rst
+  | ((TVar s)::TVarPlusEq::rst) -> collect_assignment (AssignVar s (Just Plus)) rst
+  | ((TVar s)::TVarMinusEq::rst) -> collect_assignment (AssignVar s (Just Minus)) rst
+  | ((TVar s)::TVarTimesEq::rst) -> collect_assignment (AssignVar s (Just Times)) rst
+  | ((TVar s)::TVarDivEq::rst) -> collect_assignment (AssignVar s (Just Div)) rst
+  | ((TVar s)::TVarModEq::rst) -> collect_assignment (AssignVar s (Just Mod)) rst
+  | ((TVar s)::TVarLShiftEq::rst) -> collect_assignment (AssignVar s (Just LShift)) rst
+  | ((TVar s)::TVarRShiftEq::rst) -> collect_assignment (AssignVar s (Just RShift)) rst
+  | ((TVar s)::TVarBitAndEq::rst) -> collect_assignment (AssignVar s (Just BitAnd)) rst
+  | ((TVar s)::TVarBitOrEq::rst) -> collect_assignment (AssignVar s (Just BitOr)) rst
+  | ((TVar s)::TVarBitXOrEq::rst) -> collect_assignment (AssignVar s (Just BitXOr)) rst
+  | _ -> parse_conditional tkns
+  end
+
+and collect_assignment mk tkns =
+  match parse_assignment tkns with
+  | Right (term, rst) -> Right (mk term, rst)
+  | Left e -> Left e
+  end
+
+and parse_conditional tkns =
+  match parse_bool_or tkns with
+  | Right (term, rst) -> first_conditional_term term rst
+  | Left e -> Left e
+  end
+
+and first_conditional_term boolean tkns =
+  match tkns with
+  | (TQuestion::rst1) ->
+    match parse_conditional rst1 with
+    | Right (lhs, rst2) ->
+        match second_conditional_term rst2 with
+        | Right (rhs, rst3) -> Right (Conditional boolean lhs rhs, rst3)
+        | Left e -> Left e
+        end
+    | Left e -> Left e
+    end
+  | _ -> Right (boolean, tkns)
+  end
+
+and second_conditional_term tkns =
+  match tkns with
+  | (TColon::rst1) -> parse_conditional rst1
+  | _ts -> Left "Expected ':'"
+  end
+
+and parse_bool_or tkns =
+  match parse_bool_and tkns with
+  | Right (term, rst) -> bool_or_term term rst
+  | Left e -> Left e
+  end
+
+and bool_or_term lhs tkns =
+  match tkns with
+  | (TBoolOr::rst1) ->
+    match parse_bool_and rst1 with
+    | Right (rhs, rst2) -> bool_or_term (BinOp BoolOr lhs rhs) rst2
+    | Left e -> Left e
+    end
+  | _ -> Right (lhs, tkns)
+  end
+
+and parse_bool_and tkns =
+  match parse_bit_or tkns with
+  | Right (term, rst) -> bool_and_term term rst
+  | Left e -> Left e
+  end
+
+and bool_and_term lhs tkns =
+  match tkns with
+  | (TBoolAnd::rst1) ->
+    match parse_bit_or rst1 with
+    | Right (rhs, rst2) -> bool_and_term (BinOp BoolAnd lhs rhs) rst2
+    | Left e -> Left e
+    end
+  | _ -> Right (lhs, tkns)
+  end
+
+and parse_bit_or tkns =
+  match parse_bit_xor tkns with
+  | Right (term, rst) -> bit_or_term term rst
+  | Left e -> Left e
+  end
+
+and bit_or_term lhs tkns =
+  match tkns with
+  | (TBitOr::rst1) ->
+    match parse_bit_xor rst1 with
+    | Right (rhs, rst2) -> bit_or_term (BinOp BitOr lhs rhs) rst2
+    | Left e -> Left e
+    end
+  | _ -> Right (lhs, tkns)
+  end
+
+and parse_bit_xor tkns =
+  match parse_bit_and tkns with
+  | Right (term, rst) -> bit_xor_term term rst
+  | Left e -> Left e
+  end
+
+and bit_xor_term lhs tkns =
+  match tkns with
+  | (TBitXOr::rst1) ->
+    match parse_bit_and rst1 with
+    | Right (rhs, rst2) -> bit_xor_term (BinOp BitXOr lhs rhs) rst2
+    | Left e -> Left e
+    end
+  | _ -> Right (lhs, tkns)
+  end
+
+and parse_bit_and tkns =
+  match parse_equality tkns with
+  | Right (term, rst) -> bit_and_term term rst
+  | Left e -> Left e
+  end
+
+and bit_and_term lhs tkns =
+  match tkns with
+  | (TBitAnd::rst1) ->
+    match parse_equality rst1 with
+    | Right (rhs, rst2) -> bit_and_term (BinOp BitAnd lhs rhs) rst2
+    | Left e -> Left e
+    end
+  | _ -> Right (lhs, tkns)
+  end
+
+and collect_bit_and mk tkns =
+  match parse_equality tkns with
+  | Right (term, rst) -> bit_and_term (mk term) rst
+  | Left e -> Left e
+  end
+
+and parse_equality tkns =
+  match parse_relational tkns with
+  | Right (term, rst) -> equality_term term rst
+  | Left e -> Left e
+  end
+
+and equality_term lhs tkns =
+  match tkns with
+  | (TEq::rst) -> collect_equality (BinOp Eq lhs) rst
+  | (TNEq::rst) -> collect_equality (BinOp NEq lhs) rst
+  | _ -> Right (lhs, tkns)
+  end
+
+and collect_equality mk tkns =
+  match parse_relational tkns with
+  | Right (term, rst) -> equality_term (mk term) rst
+  | Left e -> Left e
+  end
+
+and parse_relational tkns =
+  match parse_bit_shift tkns with
+  | Right (term, rst) -> relational_term term rst
+  | Left e -> Left e
+  end
+
+and relational_term lhs tkns =
+  match tkns with
+  | (TLt::rst) -> collect_relational (BinOp Lt lhs) rst
+  | (TLte::rst) -> collect_relational (BinOp Lte lhs) rst
+  | (TGt::rst) -> collect_relational (BinOp Gt lhs) rst
+  | (TGte::rst) -> collect_relational (BinOp Gte lhs) rst
+  | _ -> Right (lhs, tkns)
+  end
+
+and collect_relational mk tkns =
+  match parse_bit_shift tkns with
+  | Right (term, rst) -> relational_term (mk term) rst
+  | Left e -> Left e
+  end
+
+and parse_bit_shift tkns =
+  match parse_additive tkns with
+  | Right (term, rst) -> shift_term term rst
+  | Left e -> Left e
+  end
+
+and shift_term lhs tkns =
+  match tkns with
+  | (TLShift::rst) -> collect_shift (BinOp LShift lhs) rst
+  | (TRShift::rst) -> collect_shift (BinOp RShift lhs) rst
+  | _ -> Right (lhs, tkns)
+  end
+
+and collect_shift mk tkns =
+  match parse_additive tkns with
+  | Right (term, rst) -> shift_term (mk term) rst
+  | Left e -> Left e
+  end
+
+and parse_additive tkns =
+  match parse_multiplicative tkns with
+  | Right (term, rst) -> additive_term term rst
+  | Left e -> Left e
+  end
+
+and additive_term lhs tkns =
+  match tkns with
+  | (TPlus::rst) -> collect_additive (BinOp Plus lhs) rst
+  | (TMinus::rst) -> collect_additive (BinOp Minus lhs) rst
+  | _ -> Right (lhs, tkns)
+  end
+
+and collect_additive mk tkns =
+  match parse_multiplicative tkns with
+  | Right (term, rst) -> additive_term (mk term) rst
+  | Left e -> Left e
+  end
+
+and parse_multiplicative tkns =
+  match unary_term tkns with
+  | Right (term, rst) -> multiplicative_term term rst
+  | Left e -> Left e
+  end
+
+and multiplicative_term lhs tkns =
+  match tkns with
+  | (TTimes::rst) -> collect_multiplicative (BinOp Times lhs) rst
+  | (TDiv::rst) -> collect_multiplicative (BinOp Div lhs) rst
+  | (TMod::rst) -> collect_multiplicative (BinOp Mod lhs) rst
+  | _ -> Right (lhs, tkns)
+  end
+
+and collect_multiplicative mk tkns =
+  match unary_term tkns with
+  | Right (term, rst) -> multiplicative_term (mk term) rst
+  | Left e -> Left e
+  end
+
+and unary_term tkns =
+  match tkns with
+  | (TPlus::ts) -> unary_term ts
+  | (TMinus::ts) ->
+      match unary_term ts with
+      | Right (term, rst) -> Right (Neg(term), rst)
+      | Left e -> Left e
+      end
+  | (TBitNot::ts) ->
+      match unary_term ts with
+      | Right (term, rst) -> Right (BitNot(term), rst)
+      | Left e -> Left e
+      end
+  | (TBoolNot::ts) ->
+      match unary_term ts with
+      | Right (term, rst) -> Right (BoolNot(term), rst)
+      | Left e -> Left e
+      end
+  | _ -> number_term tkns
+  end
+
+and number_term tkns =
+  match tkns with
+  | ((TNum n)::ts) -> Right (Num n, ts)
+  | ((TVar s)::ts) -> Right (Var s, ts)
+  | (TLParen::ts) ->
+      match parse_assignment ts with
+      | Right(term, TRParen::ts1) -> Right (term, ts1)
+      | Right(_term, _ts) -> Left "Expected right paren found "
+      | Left e -> Left e
+      end
+  | _ts -> Left "Expected number or (expr) found"
+  end
+
+val parse_arith_exp : forall 'a. list (arith_token 'a) -> either string (arith_exp 'a)
+let parse_arith_exp tkns =
+  match parse_assignment tkns with
+  | Right (expr, []) -> Right expr
+  | Right (_, _ts) -> Left "Expected EOF but found tokens"
+  | Left e -> Left e
+  end
+
+val bool_to_num : forall 'a. Nat 'a => bool -> 'a
+let bool_to_num b =
+  if b
+  then fromNat 1
+  else fromNat 0
+
+val eval_arith : forall 'a 'b. Read 'a, Nat 'a, Eq 'a, Ord 'a, NumAdd 'a, NumMinus 'a, NumMult 'a, NumIntegerDivision 'a, NumRemainder 'a, NumPow 'a, NumNegate 'a, WordLsl 'a, WordLsr 'a, WordAsr 'a, WordNot 'a, WordAnd 'a, WordOr 'a, WordXor 'a, OS 'b => 'a -> os_state 'b -> arith_exp 'a -> either string (os_state 'b * 'a)
+let rec eval_arith bits s0 e =
+  match e with
+  | (Num n) -> Right (s0, n)
+  | (Var s) ->
+      match lookup_concrete_param s0 s with
+      | Just "" ->
+         let s1 = log_trace Trace_unspec ("used null variable '" ^ s ^ "' in arithmetic expansion, treating as 0") s0 in
+         Right (s1, fromNat 0)
+      | Just str ->
+          match read (toCharList str) with
+          | Right n -> Right (s0, n)
+          | Left e -> Left e
+          end
+      | Nothing -> 
+         if Set.member Sh_nounset s0.sh.opts
+         then Left (s ^ ": parameter unset")
+         else Right (s0, fromNat 0) (* bash follows the spec and allows this, defaulting to 0, dash does not *) (* TODO handle symbolic lookup results *)
+      end
+  | (BinOp op e1 e2) ->
+      match eval_arith bits s0 e1 with
+      | Right (s1, n1) ->
+        match eval_arith bits s1 e2 with
+          Right (s2, n2) -> match op with
+          | Plus -> Right (s2, n1 + n2)
+          | Minus -> Right (s2, n1 - n2)
+          | Times -> Right (s2, n1 * n2)
+          | Div -> if n2 = (fromNat 0) then Left "Divide by zero" else Right (s2, n1 div n2)
+          | Mod -> Right (s2, n1 mod n2)
+          | LShift ->
+              if bits = ~(fromNat 1)
+              then Right (s2, n1 lsl (toNat n2))
+              else Right (s2, n1 lsl (toNat (n2 mod bits)))
+          | RShift ->
+              if bits = ~(fromNat 1)
+              then Right (s2, n1 asr (toNat n2))
+              else Right (s2, n1 asr (toNat (n2 mod bits)))
+          | Lt -> Right (s2, bool_to_num (n1 < n2))
+          | Lte -> Right (s2, bool_to_num (n1 <= n2))
+          | Gt -> Right (s2, bool_to_num (n1 > n2))
+          | Gte -> Right (s2, bool_to_num (n1 >= n2))
+          | Eq -> Right (s2, bool_to_num (n1 = n2))
+          | NEq -> Right (s2, bool_to_num (n1 <> n2))
+          | BitAnd -> Right (s2, n1 land n2)
+          | BitOr -> Right (s2, n1 lor n2)
+          | BitXOr -> Right (s2, n1 lxor n2)
+          | BoolAnd -> Right (s2, bool_to_num (n1 <> fromNat 0 && n2 <> fromNat 0))
+          | BoolOr -> Right (s2, bool_to_num (n1 <> fromNat 0 || n2 <> fromNat 0))
+          end
+        | Left e -> Left e
+        end
+      | Left e -> Left e
+      end
+  | Neg exp ->
+      match eval_arith bits s0 exp with
+      | Right (s1, n) -> Right (s1, ~n)
+      | Left e -> Left e
+      end
+  | BitNot exp ->
+      match eval_arith bits s0 exp with
+      | Right (s1, n) -> Right (s1, lnot n)
+      | Left e -> Left e
+      end
+  | BoolNot exp ->
+      match eval_arith bits s0 exp with
+      | Right (s1, n) -> Right (s1,
+          (if n <> fromNat 0
+          then fromNat 0
+          else fromNat 1))
+      | Left e -> Left e
+      end
+  | Conditional a1 a2 a3 ->
+      match (eval_arith bits s0 a1) with
+      | Right (s1, n) ->
+          if n <> fromNat 0
+          then eval_arith bits s1 a2
+          else eval_arith bits s1 a3
+      | Left e -> Left e
+      end
+  | AssignVar s op exp ->
+      match op with
+      | Just o ->
+          match lookup_concrete_param s0 s with (* TODO lookup and THEN try_concrete, with appropriate symbolic outputs *)
+          | Just str ->
+                match read (toCharList str) with
+                | Right n ->
+                    match eval_arith bits s0 (BinOp o (Num n) exp) with
+                    | Right (s1, n2) -> 
+                       match set_param s (symbolic_string_of_string (write n2)) s1 with
+                       | Left e -> Left e
+                       | Right s2 -> Right (s2, n2)
+                       end
+                    | Left e -> Left e
+                    end
+                | Left e -> Left e
+                end
+          | Nothing -> Left ("Unbound or symbolic variable: " ^ s) (* bash follows the spec and allows this, defaulting to 0, dash does not *) (* TODO handle symbolic case *)
+          end
+      | Nothing ->
+          match eval_arith bits s0 exp with
+          | Right (s1, n) -> 
+             match set_param s (symbolic_string_of_string (write n)) s1 with
+             | Left e -> Left e
+             | Right s2 -> Right (s2, n)
+             end
+          | Left e -> Left e
+          end
+      end
+  end
+
+val arith : forall 'a 'b. Read 'a, Nat 'a, Eq 'a, Ord 'a, NumAdd 'a, NumMinus 'a, NumMult 'a, NumIntegerDivision 'a, NumRemainder 'a, NumPow 'a, NumNegate 'a, WordLsl 'a, WordLsr 'a, WordAsr 'a, WordNot 'a, WordAnd 'a, WordOr 'a, WordXor 'a, OS 'b => 'a -> os_state 'b -> symbolic_string -> either string (os_state 'b * fields)
+let arith bits s0 str =
+  match try_concrete str with
+  | Just cstr ->
+     match either_monad parse_arith_exp (lexer (toCharList cstr)) with
+     | Right aexp -> 
+        match eval_arith bits s0 aexp with
+        | Right (s1,v) -> Right (s1,[(map (C) (toCharList (write v)))])
+        | Left e -> Left ("arithmetic parse error on " ^ cstr ^ ": " ^ e)
+        end
+     | Left e -> Left ("arithmetic parsing error on " ^ cstr ^ ": " ^ e)
+     end
+  | Nothing -> Right (s0 (* TODO record something about symbolic changes *),
+                      [[Sym (SymArith (fields_of_symbolic_string str))]])
+  end
+
+(* MANUAL SPECIALIZATIONS *)
+
+(* default to 64-bit semantics *)
+val arith64 : forall 'a. OS 'a => os_state 'a -> symbolic_string -> either string (os_state 'a * fields)
+let arith64 = arith (int64FromNat 64)
+
+open import Os_symbolic
+
+(* symbolic functions to avoid manual instantiation of typeclasses in OCaml *)
+val symbolic_arith_big_num : os_state symbolic -> symbolic_string -> either string (os_state symbolic * fields)
+let symbolic_arith_big_num = arith (~(integerFromNat 1))
+
+val symbolic_arith32 : os_state symbolic -> symbolic_string -> either string (os_state symbolic * fields)
+let symbolic_arith32 = arith (int32FromNat 32)
+
+val symbolic_arith64 : os_state symbolic -> symbolic_string -> either string (os_state symbolic * fields)
+let symbolic_arith64 = arith (int64FromNat 64)
+

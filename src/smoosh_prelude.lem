@@ -1,0 +1,2344 @@
+include import Pervasives_extra
+include import Version
+include import Smoosh_num
+include import Signal
+
+import Debug
+
+(* ??? What character set does lem use for strings? Does it matter? *)
+
+(**********************************************************************)
+(* UTILITY FUNCTIONS **************************************************)
+(**********************************************************************)
+      
+val alphabetic : list char
+let alphabetic = 
+  toCharList "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+val alphanumerics : list char
+let alphanumerics = 
+  toCharList "0123456789" ++ alphabetic
+
+val is_alpha : char -> bool
+let is_alpha c = elem c alphabetic
+
+val is_alphanumeric : char -> bool
+let is_alphanumeric c = elem c alphanumerics  
+
+val is_variable_initial_char : char -> bool
+let is_variable_initial_char c = is_alpha c || c = #'_'
+
+val is_variable_char : char -> bool
+let is_variable_char c = is_alphanumeric c || c = #'_'
+
+val uppercase : string -> string
+let uppercase s = toString (List.map uppercase_char (toCharList s))
+
+let parens s = "( " ^ s ^ " )"
+
+val tails : forall 'a. list 'a -> list (list 'a)
+let rec tails xs =
+  xs :: match xs with
+        | [] -> []
+        | _::xs' -> tails xs'
+        end
+
+val compare_by_first : forall 'a 'b. Ord 'a => ('a * 'b) -> ('a * 'b) -> ordering
+let compare_by_first (a, _) (a', _) = compare a a'
+
+val insertBy : forall 'a. ('a -> 'a -> bool) -> 'a -> list 'a -> list 'a
+let rec insertBy lte x ys =
+  match ys with
+  | [] -> [x]
+  | y::ys' -> if lte x y then x::y::ys' else y::(insertBy lte x ys')
+  end
+
+val sortBy : forall 'a. ('a -> 'a -> bool) -> list 'a -> list 'a
+let sortBy lte xs = foldr (insertBy lte) [] xs
+
+val sort : forall 'a. Ord 'a => list 'a -> list 'a
+let sort = sortBy (<=)
+
+val collect_either : forall 'a 'b. list (either 'a 'b) -> (list 'a * list 'b)
+let rec collect_either l =
+  match l with
+  | [] -> ([], [])
+  | Left a::l' -> 
+     let (lefts, rights) = collect_either l' in
+     (a::lefts, rights)
+  | Right b::l' -> 
+     let (lefts, rights) = collect_either l' in
+     (lefts, b::rights)
+  end
+
+val isInfixOf : forall 'a. Eq 'a => list 'a -> list 'a -> bool
+let isInfixOf needle haystack = any (isPrefixOf needle) (tails haystack)
+
+val replace : forall 'a. Eq 'a => list 'a (* old *) -> list 'a (* new *) -> list 'a (* orig *) -> list 'a
+let rec replace l_old l_new l_orig =
+  if isPrefixOf l_old l_orig
+  then l_new ++ drop (length l_old) l_orig
+  else match l_orig with
+       | [] -> []
+       | x::l_orig' -> x::replace l_old l_new l_orig'
+       end
+
+val replace_string : string (* old *) -> string (* new *) -> string (* orig *) -> string
+let replace_string s_old s_new s_orig =
+  toString (replace (toCharList s_old) (toCharList s_new) (toCharList s_orig))
+
+val ltrim_newlines_cl : list char -> list char
+let rec ltrim_newlines_cl cl =
+  match cl with
+  | [] -> []
+  | #'\n'::cl' -> ltrim_newlines_cl cl'
+  | _ -> cl
+  end
+
+val intersperse : forall 'a. 'a -> list 'a -> list 'a
+let rec intersperse sep xs =
+  match xs with
+  | [] -> []
+  | [x] -> [x]
+  | x::xs' -> x::sep::intersperse sep xs'
+  end
+
+val trimr_one_newline : string -> string
+let trimr_one_newline s =
+  let cl = toCharList s in
+  match reverse cl with
+  | [] -> ""
+  | #'\n'::cl' -> toString (reverse cl')
+  | _ -> s
+  end
+
+val trimr_newlines : string -> string
+let trimr_newlines s =
+  let cl = toCharList s in
+  toString (reverse (ltrim_newlines_cl (reverse cl)))
+
+val pad_left_with : char -> string -> nat -> string
+let pad_left_with c s len =
+  let padding = max (len - stringLength s) 0 in
+  toString (replicate padding c)  ^ s
+
+val pad_right_with : char -> string -> nat -> string
+let pad_right_with c s len =
+  let padding = max (len - stringLength s) 0 in
+  s ^ toString (replicate padding c) 
+
+val pad_left : string -> nat -> string
+let pad_left = pad_left_with #' '
+
+val pad_right : string -> nat -> string
+let pad_right = pad_right_with #' '
+
+val maximum : forall 'a. OrdMaxMin 'a => list 'a -> 'a
+let rec maximum xs =
+  match xs with
+  | [] -> failwith "maximum got empty list"
+  | [x] -> x
+  | x::xs' -> max x (maximum xs')
+  end
+
+(* puts the thing that the predicate matches on the right (for easy access) *)
+val break : forall 'a. ('a -> bool) -> list 'a -> (list 'a) * (list 'a)
+let rec break p ls =
+  match ls with
+  | [] -> ([], [])
+  | x::xs ->
+    if p x
+    then ([], x::xs)
+    else let (xs', xs'') = break p xs in (x::xs', xs'')
+  end
+
+val spaced : string -> string -> string
+let spaced s1 s2 =
+  let sep = if s1 <> "" && s2 <> "" then " " else "" in
+  s1 ^ sep ^ s2
+
+val spaced_many : list string -> string
+let rec spaced_many ss =
+  match ss with
+  | [] -> ""
+  | [s] -> s
+  | s::ss' -> spaced s (spaced_many ss')
+  end
+
+val break_on_esc : bool -> char -> list char -> (list char) * (list char)
+let rec break_on_esc escapable sep ls =
+  match (escapable,ls) with
+  | (_,[]) -> ([], [])
+  | (true,#'\\'::c::cs) ->
+     let (cs', cs'') = break_on_esc escapable sep cs in 
+     (#'\\'::c::cs', cs'')
+  | (_,c::cs) ->
+    if sep = c
+    then ([], cs)
+    else let (cs', cs'') = break_on_esc escapable sep cs in 
+         (c::cs', cs'')
+  end
+
+val split_on : bool -> char -> list char -> list (list char)
+let rec split_on escapable sep cs =
+  match break_on_esc escapable sep cs with
+  | ([], []) -> []
+  | (cs', []) -> [cs']
+  | (cs', cs'') -> cs'::(split_on escapable sep cs'')
+  end
+
+val split_string_on : bool -> char -> string -> list string
+let split_string_on escapable sep s =
+  map toString (split_on escapable sep (toCharList s))
+
+val adjust_nth : forall 'a 'b. list 'a -> nat -> ('a -> 'a * 'b) -> maybe (list 'a * 'b)
+let rec adjust_nth l n f =
+  match (l,n) with
+  | ([],_) -> Nothing
+  | (v::l',0) -> 
+     let (v',res) = f v in
+     Just (v'::l',res)
+  | (v::l',_) ->
+     match adjust_nth l' (n-1) f with
+     | Nothing -> Nothing
+     | Just (l'',res) -> Just (v::l'',res)
+     end
+  end
+
+(**********************************************************************)
+(* LOCALES ************************************************************)
+(**********************************************************************)
+
+type range_char = 
+    RChar of char
+  | RCollating of string
+
+type locale = 
+  <| name : string ;
+     collates : char -> string -> bool ; 
+     equiv : char -> string -> bool ; 
+     charclass : char -> string -> bool ; 
+     range : char -> range_char -> range_char -> bool |>
+
+(* TODO: look at LC_ environment variables, decide what to do *)
+
+(* need functions for various locale operations on, e.g., matching collating elements, equivalence classes, character classes, and ranges *)
+
+let between lo c hi = lo <= c && c <= hi
+
+let rec ambient_charclass c cls = 
+  match cls with     (* TODO expose is_ functions from ctypes into ocaml, just use those *)
+  | "alnum" -> ambient_charclass c "alpha" || ambient_charclass c "digit"
+  | "alpha" -> ambient_charclass c "upper" || ambient_charclass c "lower"
+  | "blank" -> elem c (toCharList " \t")
+  | "cntrl" -> ord c < ord #' ' || ord c = 127 (* del *)
+  | "digit" -> elem c (toCharList "0123456789")
+  | "graph" -> ambient_charclass c "alnum" || ambient_charclass c "punct"
+  | "lower" -> between (ord #'a') (ord c) (ord #'z')
+  | "print" -> ambient_charclass c "graph" || c = #' '
+  | "punct" -> elem c (toCharList "!\"#$%&'()*+,-./:;<=>?@[\\]^_{}~|") || ord c = 200 (* grave accent *)
+  | "space" -> elem c (toCharList " \t\n\r") || ord c = 11 (* VT *) || ord c = 14 (* FF *)
+  | "upper" -> between (ord #'A') (ord c) (ord #'Z')
+  | "xdigit" -> elem c (toCharList "0123456789ABCDEFabcdef")
+  | _ -> false
+  end 
+
+let lc_ambient = 
+  let collates c cls = elem c (toCharList cls) in (* TODO strcoll-ish *)
+  let equiv c cls = elem c (toCharList cls) in (* derp derp *)
+  let rchar (rc:range_char) : maybe char =
+    match rc with
+    | RChar c -> Just c
+    | RCollating s -> 
+       match toCharList s with
+       | [c] -> Just c
+       | _ -> Nothing
+       end
+    end in
+  let range c rlo rhi = 
+    match (rchar rlo, rchar rhi) with
+    | (Just lo, Just hi) -> between (ord lo) (ord c) (ord hi)
+    | _ -> false
+    end in
+  <| name = "ambient" ; collates = collates ; equiv = equiv ; charclass = ambient_charclass ; range = range |>
+
+(**********************************************************************)
+(* FILE PERMISSIONS ***************************************************)
+(**********************************************************************)
+
+type file_perm = Read | Write | Execute
+
+(* can be interpreted as a mask or as actual permissions *)
+type perms = <|
+    setuid: bool;
+    setgid: bool;
+    sticky: bool;
+    user: set file_perm;
+    group: set file_perm;
+    other: set file_perm
+  |>
+
+val perms_all_clear : perms
+let perms_all_clear =
+  <| setuid = false; setgid = false; sticky = false;
+     user = Set.empty;
+     group = Set.empty;
+     other = Set.empty |>
+
+val all_file_perms : set file_perm
+let all_file_perms = Set.fromList [Read; Write; Execute]
+
+val default_umask : perms
+let default_umask = <| setuid = false; setgid = false; sticky = false;
+                       user = Set.empty;
+                       group = Set.singleton Write;
+                       other = Set.singleton Write |>
+
+val invert_file_perms : set file_perm -> set file_perm
+let invert_file_perms fperms = Set.difference all_file_perms fperms
+
+val invert_perms : perms -> perms
+let invert_perms perms =
+  <| setuid = not perms.setuid;
+     setgid = not perms.setgid;
+     sticky = not perms.sticky;
+     user   = invert_file_perms perms.user;
+     group  = invert_file_perms perms.group;
+     other  = invert_file_perms perms.other
+  |>
+
+(**********************************************************************)
+(* Basic parsing and rendering of perms *******************************)
+(**********************************************************************)
+
+val nat_of_file_perms : set file_perm -> nat
+let nat_of_file_perms fperms =
+  let bit0 = if Set.member Execute fperms then 1 else 0 in
+  let bit1 = if Set.member Write   fperms then 2 else 0 in
+  let bit2 = if Set.member Read    fperms then 4 else 0 in
+  bit0 + bit1 + bit2
+
+val file_perms_of_nat : nat -> set file_perm
+let file_perms_of_nat n =
+  let r = if has_bit n 0 then Set.singleton Execute else Set.empty in
+  let w = if has_bit n 1 then Set.singleton Write   else Set.empty in
+  let x = if has_bit n 2 then Set.singleton Read    else Set.empty in
+  Set.(union) r (Set.(union) w x)
+
+val perms_of_nat : nat -> perms
+let perms_of_nat n =
+  <| other  = file_perms_of_nat n;
+     group  = file_perms_of_nat (n / 8);
+     user   = file_perms_of_nat (n / 64);
+     sticky = has_bit n 9;
+     setgid = has_bit n 10;
+     setuid = has_bit n 11
+  |>
+
+val nat_of_perms : perms -> nat
+let nat_of_perms perms =
+  let bit0 = if perms.sticky then 1 else 0 in
+  let bit1 = if perms.setgid then 2 else 0 in
+  let bit2 = if perms.setuid then 4 else 0 in
+  let first  = bit0 + bit1 + bit2 in
+  let second = nat_of_file_perms perms.user in
+  let third  = nat_of_file_perms perms.group in
+  let fourth = nat_of_file_perms perms.other in
+  (2**9 * first) + (2**6 * second) + (2**3 * third) + fourth
+
+val octal_string_of_perms : perms -> string
+let octal_string_of_perms perms =
+  let bit0 = if perms.sticky then 1 else 0 in
+  let bit1 = if perms.setgid then 2 else 0 in
+  let bit2 = if perms.setuid then 4 else 0 in
+  let first  = stringFromNat (bit0 + bit1 + bit2) in
+  let second = stringFromNat (nat_of_file_perms perms.user) in
+  let third  = stringFromNat (nat_of_file_perms perms.group) in
+  let fourth = stringFromNat (nat_of_file_perms perms.other) in
+  first ^ second ^ third ^ fourth
+
+val string_of_file_perms : set file_perm -> string
+let string_of_file_perms fperms = 
+  let r = if Set.member Read    fperms then "r" else "" in
+  let w = if Set.member Write   fperms then "w" else "" in
+  let x = if Set.member Execute fperms then "x" else "" in
+  r ^ w ^ x
+
+val string_of_perms : perms -> string
+let string_of_perms perms =
+  let u = string_of_file_perms perms.user in
+  let g = string_of_file_perms perms.group in
+  let o = string_of_file_perms perms.other in
+  "u=" ^ u ^ "," ^
+  "g=" ^ g ^ "," ^
+  "o=" ^ o
+
+(**********************************************************************)
+(* Symbolic file permissions a la chmod *******************************)
+(**********************************************************************)
+
+(* Grammar fragments taken from chmod spec
+   http://pubs.opengroup.org/onlinepubs/9699919799/utilities/chmod.html *)
+
+(*
+wholist          : who | wholist who
+who              : 'u' | 'g' | 'o' | 'a'
+*)
+type perms_who = WhoU | WhoG | WhoO
+
+let perms_wholist_all = Set.fromList [WhoU; WhoG; WhoO]
+
+val perms_who : perms_who -> perms -> set file_perm
+let perms_who who perms =
+  match who with
+  | WhoU -> perms.user
+  | WhoG -> perms.group
+  | WhoO -> perms.other
+  end
+
+val perms_for : (set file_perm -> set file_perm) -> perms_who -> perms -> perms
+let perms_for f who perms =
+  match who with
+  | WhoU -> <| perms with user = f perms.user |>
+  | WhoG -> <| perms with group = f perms.group |>
+  | WhoO -> <| perms with other = f perms.other |>
+  end
+
+val perms_for_many : (set file_perm -> set file_perm) -> set perms_who -> perms -> perms
+let perms_for_many f who perms = List.foldr (perms_for f) perms (Set_extra.toList who)
+
+val perms_clear : set perms_who -> perms -> perms
+let perms_clear who perms = perms_for_many (fun _ -> Set.empty) who perms
+
+val perms_wholist_of_cl 
+    : set perms_who -> list char -> either string (set perms_who * list char)
+let rec perms_wholist_of_cl who cs = 
+  match cs with
+  | #'u'::cs' -> perms_wholist_of_cl (Set.insert WhoU who) cs'
+  | #'g'::cs' -> perms_wholist_of_cl (Set.insert WhoG who) cs'
+  | #'o'::cs' -> perms_wholist_of_cl (Set.insert WhoO who) cs'
+  | #'a'::cs' -> perms_wholist_of_cl perms_wholist_all cs'
+  | _ -> 
+     if Set.null who 
+     then Left "empty wholist: need to specify one of ugoa"
+     else Right (who, cs)
+  end
+
+(* 
+permlist         : perm | perm permlist
+perm             : 'r' | 'w' | 'x' | 'X' | 's' | 't'  
+*)
+(* renaming to perms_flag just for clarity *)
+type perms_flag = PermR | PermW | PermX | PermBigX | PermS | PermT
+
+val flag_of_file_perm : file_perm -> perms_flag
+let flag_of_file_perm fp =
+  match fp with
+  | Read -> PermR
+  | Write -> PermW
+  | Execute -> PermX
+  end
+
+val perms_flaglist_of_cl
+  : set perms_flag -> list char -> either string (set perms_flag * list char)
+let rec perms_flaglist_of_cl perms cs =
+  match cs with
+  | #'r'::cs' -> perms_flaglist_of_cl (Set.insert PermR perms) cs'
+  | #'w'::cs' -> perms_flaglist_of_cl (Set.insert PermW perms) cs'
+  | #'x'::cs' -> perms_flaglist_of_cl (Set.insert PermX perms) cs'
+  | #'X'::cs' -> perms_flaglist_of_cl (Set.insert PermBigX perms) cs'
+  | #'s'::cs' -> perms_flaglist_of_cl (Set.insert PermS perms) cs'
+  | #'t'::cs' -> perms_flaglist_of_cl (Set.insert PermT perms) cs'
+  | _ -> 
+     if Set.null perms 
+     then Left "empty permlist: need to specify one of rwxXst"
+     else Right (perms, cs) 
+  end
+
+(*
+actionlist       : action | actionlist action
+action           : op | op permlist | op permcopy
+permcopy         : 'u' | 'g' | 'o'
+op               : '+' | '-' | '='
+*)
+
+type perms_op = OpPlus | OpMinus | OpEqual
+type perms_action = 
+    ActOp of perms_op 
+  | ActPerms of perms_op * set perms_flag
+  | ActCopy of perms_op * perms_who
+
+val perms_op_of_cl : list char -> either string (perms_op * list char)
+let perms_op_of_cl cs =
+  match cs with
+  | #'+'::cs' -> Right (OpPlus, cs')
+  | #'-'::cs' -> Right (OpMinus, cs')
+  | #'='::cs' -> Right (OpEqual, cs')
+  | c::_ -> Left ("expected op (one of +-=), got '" ^ toString [c] ^ "'")
+  | [] -> Left ("expected op (one of +-=, got empty string")
+  end
+
+val perms_actionlist_of_cl 
+  : list perms_action -> list char -> either string (list perms_action * list char)
+let rec perms_actionlist_of_cl actions cs =
+  match perms_op_of_cl cs with
+  | Right (op, cs') ->
+     (* we need to check whether we have a list of perms, a ugo to copy, or nothing 
+      *)
+     match (cs', perms_flaglist_of_cl Set.empty cs') with
+       (* ugo? *)
+     | (#'u'::cs'', _) -> perms_actionlist_of_cl ((ActCopy op WhoU)::actions) cs''
+     | (#'g'::cs'', _) -> perms_actionlist_of_cl ((ActCopy op WhoG)::actions) cs''
+     | (#'o'::cs'', _) -> perms_actionlist_of_cl ((ActCopy op WhoO)::actions) cs''
+       (* permlist? *)
+     | (_, Right (permlist,cs'')) ->
+        perms_actionlist_of_cl (ActPerms op permlist::actions) cs''
+       (* must be plain! *)
+     | _ -> perms_actionlist_of_cl (ActOp op::actions) cs'
+     end
+  | Left msg -> 
+     (* we didn't get an op, so just make sure our list is nonempty *)
+     if null actions
+     then Left ("empty actionlist: " ^ msg)
+     else 
+       (* reverse to get them back in the original order *)
+       Right (List.reverse actions, cs)
+  end
+
+
+(* 
+clause           : actionlist | wholist actionlist
+*)
+
+type perms_clause = (set perms_who) * list perms_action
+
+val perms_clause_of_cl : list char -> either string (perms_clause * list char)
+let perms_clause_of_cl cs =
+  let (who, cs') =
+    match perms_wholist_of_cl Set.empty cs with
+    | Right (who, cs') -> (who, cs')
+    | Left _ -> 
+       (* when unspecified, perms mean ALL *)
+       (perms_wholist_all, cs)
+    end 
+  in
+  match perms_actionlist_of_cl [] cs' with
+  | Right (actions, cs'') -> Right ((who, actions), cs'')
+  | Left msg -> Left ("bad clause: " ^ msg)
+  end
+
+(* symbolic_mode    : clause | symbolic_mode ',' clause *)
+type perms_symbolic = list perms_clause
+
+val perms_symbolic_of_cl 
+    : perms_symbolic -> list char -> either string (perms_symbolic * list char)
+let rec perms_symbolic_of_cl perms cs =
+  match perms_clause_of_cl cs with
+  | Left msg -> Left ("no clauses found: " ^ msg)
+  | Right (clause, []) -> Right (clause::perms, [])
+  | Right (clause, #','::cs') -> perms_symbolic_of_cl (clause::perms) cs'
+  | Right (_,c::_) -> 
+     Left ("expected comma between clauses, found '" ^ toString [c] ^ "'")
+  end
+
+val perms_symbolic_of_string : string -> either string perms_symbolic
+let rec perms_symbolic_of_string s = 
+  match perms_symbolic_of_cl [] (toCharList s) with
+  | Left msg -> Left msg
+  | Right (perms,[]) -> Right perms
+  | Right (_,cs') -> Left ("invalid symbolic permissions: " ^ toString cs')
+  end
+
+(**********************************************************************)
+(* SHELL OPTIONS ******************************************************)
+(**********************************************************************)
+
+type trace_tag =
+    Trace_symbolic
+  | Trace_syscall
+  | Trace_traps
+  | Trace_undef
+  | Trace_unspec
+
+val string_of_trace_tag : trace_tag -> string
+let string_of_trace_tag tag =
+  match tag with
+  | Trace_symbolic -> "symbolic"
+  | Trace_syscall  -> "syscall"
+  | Trace_traps    -> "traps"
+  | Trace_undef    -> "undef"
+  | Trace_unspec   -> "unspec"
+  end
+
+val trace_tag_of_string : string -> maybe trace_tag
+let trace_tag_of_string s =
+  match s with
+  | "symbolic" -> Just Trace_symbolic
+  | "syscall"  -> Just Trace_syscall
+  | "traps"    -> Just Trace_traps
+  | "undef"    -> Just Trace_undef
+  | "unspec"   -> Just Trace_unspec 
+  | _          -> Nothing
+  end
+
+val all_trace_tags : list trace_tag
+let all_trace_tags = sortBy (fun t1 t2 -> string_of_trace_tag t1 <= string_of_trace_tag t2)
+  [ Trace_symbolic
+  ; Trace_syscall
+  ; Trace_traps
+  ; Trace_undef
+  ; Trace_unspec
+  ]
+  
+type sh_opt = 
+    Sh_allexport   
+  | Sh_errexit
+  | Sh_ignoreeof
+  | Sh_earlyhash   (* not supported by dash *)
+  | Sh_interactive
+  | Sh_monitor     (* UP option *)
+  | Sh_noclobber
+  | Sh_noglob
+  | Sh_noexec
+  | Sh_nolog
+  | Sh_notify      (* UP option *)
+  | Sh_nounset
+  | Sh_verbose
+  | Sh_vi
+  | Sh_xtrace
+  (* custom smoosh stuff *)
+  | Sh_nonlexicalctrl
+  | Sh_trace of trace_tag
+
+let string_of_sh_opt o =
+  match o with
+  | Sh_allexport      -> "allexport"
+  | Sh_errexit        -> "errexit"
+  | Sh_ignoreeof      -> "ignoreeof"
+  | Sh_earlyhash      -> "earlyhash"
+  | Sh_interactive    -> "interactive"
+  | Sh_monitor        -> "monitor"
+  | Sh_noclobber      -> "noclobber"
+  | Sh_noglob         -> "noglob"
+  | Sh_noexec         -> "noexec"
+  | Sh_nolog          -> "nolog"
+  | Sh_notify         -> "notify"
+  | Sh_nounset        -> "nounset"
+  | Sh_verbose        -> "verbose"
+  | Sh_vi             -> "vi"
+  | Sh_xtrace         -> "xtrace"
+  | Sh_nonlexicalctrl -> "nonlexicalctrl"
+  | Sh_trace tag      -> "trace" ^ string_of_trace_tag tag
+  end
+
+let char_of_sh_opt o =
+  match o with
+  | Sh_allexport      -> Just #'a'
+  | Sh_errexit        -> Just #'e'
+  | Sh_ignoreeof      -> Nothing
+  | Sh_earlyhash      -> Just #'h'
+  | Sh_interactive    -> Just #'i'
+  | Sh_monitor        -> Just #'m'
+  | Sh_noclobber      -> Just #'C'
+  | Sh_noglob         -> Just #'f'
+  | Sh_noexec         -> Just #'n'
+  | Sh_nolog          -> Nothing
+  | Sh_notify         -> Just #'b'
+  | Sh_nounset        -> Just #'u'
+  | Sh_verbose        -> Just #'v'
+  | Sh_vi             -> Nothing
+  | Sh_xtrace         -> Just #'x'
+  | Sh_nonlexicalctrl -> Nothing
+  | Sh_trace _        -> Nothing
+  end
+
+let sh_opt_of_shortopt so = 
+  match so with
+  | #'a' -> Just Sh_allexport
+  | #'b' -> Just Sh_notify   
+  | #'C' -> Just Sh_noclobber
+  | #'e' -> Just Sh_errexit  
+  | #'f' -> Just Sh_noglob   
+  | #'h' -> Just Sh_earlyhash
+  | #'m' -> Just Sh_monitor  
+  | #'n' -> Just Sh_noexec   
+  | #'u' -> Just Sh_nounset  
+  | #'v' -> Just Sh_verbose  
+  | #'x' -> Just Sh_xtrace   
+  | _ -> Nothing
+  end
+
+let sh_opt_of_longopt lo =
+  match lo with
+  | "allexport" -> Just Sh_allexport
+  | "errexit" -> Just Sh_errexit
+  | "ignoreeof" -> Just Sh_ignoreeof
+  | "monitor" -> Just Sh_monitor
+  | "noclobber" -> Just Sh_noclobber
+  | "noglob" -> Just Sh_noglob
+  | "noexec" -> Just Sh_noexec
+  | "nolog" -> Just Sh_nolog
+  | "notify" -> Just Sh_notify
+  | "nounset" -> Just Sh_nounset
+  | "verbose" -> Just Sh_verbose
+  | "vi" -> Just Sh_vi
+  | "xtrace" -> Just Sh_xtrace
+  | "nonlexicalctrl" -> Just Sh_nonlexicalctrl
+  | _ -> 
+     let cs = toCharList lo in
+     match cs with
+     | #'t':: #'r':: #'a':: #'c'::#'e'::tag_cs ->
+        match trace_tag_of_string (toString tag_cs) with
+        | Nothing -> Nothing
+        | Just tag -> Just (Sh_trace tag)
+        end
+     | _ -> Nothing
+     end
+  end
+
+val all_sh_opts : list sh_opt
+let all_sh_opts = sortBy (fun o1 o2 -> string_of_sh_opt o1 <= string_of_sh_opt o2)
+  ([ Sh_allexport
+   ; Sh_errexit
+   ; Sh_ignoreeof
+   ; Sh_earlyhash
+   ; Sh_interactive
+   ; Sh_monitor 
+   ; Sh_noclobber
+   ; Sh_noglob
+   ; Sh_noexec
+   ; Sh_errexit
+   ; Sh_nolog
+   ; Sh_notify
+   ; Sh_nounset
+   ; Sh_verbose
+   ; Sh_vi
+   ; Sh_xtrace
+   ; Sh_nonlexicalctrl] ++ 
+     map Sh_trace all_trace_tags)
+
+val unimplemented_sh_opts : list sh_opt
+let unimplemented_sh_opts = 
+  [ (* will not support *)
+    Sh_vi
+  ]
+
+(**********************************************************************)
+(* Patterns ***********************************************************)
+(**********************************************************************)
+
+type substring_mode =
+  Shortest
+| Longest
+
+type substring_side =
+  Prefix
+| Suffix  
+
+(**********************************************************************)
+(* Redirects **********************************************************)
+(**********************************************************************)
+
+type redir_type = To | Clobber | From | FromTo | Append
+type dup_type = ToFD | FromFD
+type heredoc_type = Here (* quoted heredoc name, for when the heredoc shouldn't do any expansion *) | XHere (* unquoted, do expansion *)
+
+type orig_fd_action = CloseOrig | LeaveOrig
+
+val should_close_orig : orig_fd_action -> bool
+let should_close_orig orig_fd_action =
+  match orig_fd_action with
+  | CloseOrig -> true
+  | LeaveOrig -> false
+  end
+
+(**********************************************************************)
+(* Other modes, options, and flags ************************************)
+(**********************************************************************)
+(* NB we write custom tester functions with complete pattern matches
+   rather than using equality tests so that we can freely add cases
+   without having to worry about introducing logic bugs *)
+
+type command_opts =
+  <| ran_cmd_subst : bool;
+     should_fork : bool;
+     force_simple_command : bool
+  |>
+
+type splitting_mode =
+    Split
+  | NoSplit
+
+let should_split sm =
+  match sm with
+  | Split -> true
+  | NoSplit -> false
+  end
+
+type expansion_opts =
+  <| splitting : splitting_mode;
+     globbing : bool
+  |>
+
+type bg_mode = FG | BG
+
+val is_fg : bg_mode -> bool
+let is_fg bg_mode =
+  match bg_mode with
+  | BG -> false
+  | FG -> true
+  end
+
+val is_bg : bg_mode -> bool
+let is_bg bg_mode =
+  match bg_mode with
+  | BG -> true
+  | FG -> false
+  end
+
+type interactivity_mode = Interactive | Noninteractive
+
+val is_interactive_mode : interactivity_mode -> bool
+let is_interactive_mode interactivity_mode =
+  match interactivity_mode with
+  | Interactive -> true
+  | Noninteractive -> false
+  end
+
+type shell_level = Toplevel | Subsidiary
+
+val is_toplevel : shell_level -> bool
+let is_toplevel toplevel_mode =
+  match toplevel_mode with
+  | Toplevel -> true
+  | Subsidiary -> false
+  end
+
+type binsh_mode = TryBinSh | NoBinSh
+
+val try_binsh : binsh_mode -> bool
+let try_binsh binsh_mode =
+  match binsh_mode with
+  | TryBinSh -> true
+  | NoBinSh -> false
+  end
+
+type checking_mode = Checked | Unchecked
+
+val checked_exit : checking_mode -> bool
+let checked_exit checking_mode =
+  match checking_mode with
+  | Checked -> true
+  | Unchecked -> false
+  end
+
+type wait_mode = WaitCommand | WaitInternal
+
+val from_wait_command : wait_mode -> bool
+let from_wait_command wait_mode =
+  match wait_mode with
+  | WaitCommand -> true
+  | WaitInternal -> false
+  end
+
+(**********************************************************************)
+(* AST ****************************************************************)
+(**********************************************************************)
+
+type parse_string_mode =
+    ParseEval
+  | ParseTrap
+
+type parse_file_mode =
+    PushFile
+  | NoPushFile
+
+val should_push_file : parse_file_mode -> bool
+let should_push_file pfm =
+  match pfm with
+  | PushFile -> true
+  | NoPushFile -> false
+  end
+
+type parse_source =
+  | ParseSTDIN
+  | ParseString of parse_string_mode * string
+  | ParseFile of string * parse_file_mode
+
+(**********************************************************************)
+(* AST ****************************************************************)
+(**********************************************************************)
+
+type pid = nat
+
+type stackmark
+declare ocaml target_rep type stackmark = `Ctypes.structure` `Dash.stackmark`
+
+type dash_string
+declare ocaml target_rep type dash_string = `Ctypes.ptr` char
+        
+type format =
+    Normal
+  | Default of words
+  | NDefault of words
+  | Assign of words
+  | NAssign of words
+  | Error of words
+  | NError of words
+  | Alt of words
+  | NAlt of words
+  | Length
+  | Substring of substring_side * substring_mode * words
+                                
+(* Treating parameters niavely led to a problem when evaluating
+ * ${x=${x=foo}bar${x=baz}} incorrectly when x was unset
+ *)
+and control =
+    Tilde of string
+  | Param of string * format
+  | LAssign of string * expanded_words * words (* runtime technicality *)
+  | LMatch of fields * substring_side * substring_mode * expanded_words * words (* runtime technicality *)
+  | LError of string * expanded_words * words (* runtime technicality *)
+  | Backtick of stmt
+  | LBacktick of stmt (* original stmt *) * pid * fd (* pipe [read] *)
+  | LBacktickWait of stmt (* original stmt *) * pid * string (* result of command *)
+  | Arith of expanded_words (* runtime technicality *) * words
+  | Quote of expanded_words (* runtime technicality *) * words
+
+and entry =
+    S of string
+  | K of control
+  | F
+  | ESym of sym (* embedded symbolic entries *)
+
+and words = list entry
+          
+and stmt =
+    Command of list (string * words) * words * list redir * command_opts
+  | CommandExpArgs of list (string * words) * expansion_state * list redir * command_opts
+  | CommandExpRedirs of list (string * words) * fields * redir_state * command_opts
+  | CommandExpAssign of list (string * expansion_state) * fields * saved_fds * command_opts
+  | CommandReady of list (string * symbolic_string) * symbolic_string * fields * saved_fds * command_opts
+  | Pipe of bg_mode * list stmt
+  | Redir of stmt * redir_state
+  | Background of stmt * redir_state
+  | Subshell of stmt * redir_state
+  | And of stmt * stmt
+  | Or of stmt * stmt
+  | Not of stmt
+  | Semi of stmt * stmt
+  | If of stmt * stmt * stmt
+  | While of stmt * stmt
+  | WhileCond of stmt (* original cond *) * stmt (* current cond *) * stmt (* original body *) * maybe nat (* possibly saved ec *)
+  | WhileRunning of stmt (* original cond *) * stmt (* original body *) * stmt (* current body *)
+  | For of string * words * stmt
+  | ForExpArgs of string * expansion_state * stmt
+  | ForExpanded of string * fields * stmt
+  | ForRunning of string * fields * stmt (* original body *) * stmt (* current body *)
+  | Case of words * list (list words * stmt)
+  | CaseExpArg of expansion_state * list (list words * stmt)
+  | CaseMatch of symbolic_string * list (list words * stmt)
+  | CaseCheckMatch of symbolic_string * expansion_state (* current pattern *) * stmt (* current command(s) *) * list (list words * stmt) (* remaining cases *)
+  | Defun of string * stmt
+  | Call of nat (* outer loop_nest, to be restored *) * fields (* outer $1, $2, $3, etc *) * string (* function name *) * stmt (* orig body *) * stmt (* current body *)
+  | EvalLoop of nat (* linno *) * parse_context * parse_source * interactivity_mode * shell_level
+  | EvalLoopCmd of nat (* linno *) * parse_context * parse_source * interactivity_mode * shell_level * stmt
+  | Break of nat
+  | Continue of nat
+  | Return
+  | Exit
+  | Exec of symbolic_string (* cmd path *) * symbolic_string (* cmd name *) * list symbolic_string * env * binsh_mode
+  | Wait of pid 
+          * checking_mode
+          * maybe nat (* Nothing = block; Just n = n steps *)
+          * wait_mode
+  | Trapped of signal * nat (* ec to restore *) * stmt (* current handler *) * stmt (* continuation *)
+  | CheckedExit of stmt
+  | Pushredir of stmt * saved_fds
+  | Done
+
+(* TODO 2018-08-24 refactor into redir 'a with appropriate params *)
+and redir = 
+   | RFile of redir_type * nat * words
+   | RDup of dup_type * nat * words
+   | RHeredoc of heredoc_type * nat * words
+
+and expanding_redir =
+   | XRFile of redir_type * nat * expansion_state
+   | XRDup of dup_type * nat * expansion_state
+   | XRHeredoc of heredoc_type * nat * expansion_state
+
+and expanded_redir = 
+   | ERFile of redir_type * nat * symbolic_string
+   | ERDup of dup_type * orig_fd_action * nat * maybe nat
+   | ERHeredoc of heredoc_type * nat * symbolic_string
+
+and redir_state = list expanded_redir * maybe expanding_redir * list redir
+
+(**********************************************************************)
+(* Expansion **********************************************************)
+(**********************************************************************)
+
+and expanded_word =
+   UsrF
+ | ExpS of string
+ | UsrS of string
+ | At of fields
+ | DQuo of symbolic_string
+ | EWSym of sym
+
+and expanded_words = list expanded_word
+
+(* final expansion output *)
+and sym =
+    SymArith of fields (* symbolic result of arithmetic evaluation *) (* TODO is fields necessary? *)
+  | SymCommand of stmt (* symbolic result of evaluating a command *)
+  | SymPat of substring_side * substring_mode * symbolic_string * symbolic_string (* symbolic result of pattern matching (mode, pat, string) *)
+and symbolic_char =
+    C of char
+  | Sym of sym
+and symbolic_string = list symbolic_char
+
+and fields = list (symbolic_string)
+
+and tmp_field =
+    WFS
+  | FS
+  | Field of symbolic_string
+  | QField of symbolic_string
+
+and intermediate_fields = list tmp_field
+
+and expansion_state = 
+    (* the constructor name indicates the *next* step to perform *)
+    ExpStart of expansion_opts * words
+  | ExpExpand of expansion_opts * expanded_words * words
+  | ExpSplit of expansion_opts (* partially ignored *)  * expanded_words
+  | ExpPath of expansion_opts (* partially ignored *) * intermediate_fields
+  | ExpQuote of expansion_opts (* ignored *) * intermediate_fields
+  | ExpError of fields
+  | ExpDone of fields
+
+and expansion_step =
+    ESTilde of string
+  | ESParam of string
+  | ESCommand of string
+  | ESArith of string
+  | ESSplit of string
+  | ESPath of string
+  | ESQuote of string
+  | ESStep of string
+  | ESNested of expansion_step * expansion_step
+  | ESEval of expansion_step * evaluation_step
+
+and evaluation_step =
+    XSSimple of string
+  | XSPipe of string
+  | XSRedir of string
+  | XSBackground of string
+  | XSSubshell of string
+  | XSAnd of string
+  | XSOr of string
+  | XSNot of string
+  | XSSemi of string
+  | XSIf of string
+  | XSWhile of string
+  | XSFor of string
+  | XSCase of string
+  | XSDefun of string
+  | XSStack of string (* function name *) * evaluation_step 
+  | XSStep of string
+  | XSExec of string
+  | XSEval of nat * parse_source * string
+  | XSWait of string
+  | XSTrap of signal * string
+  | XSProc of pid * stmt
+  | XSNested of evaluation_step * evaluation_step
+  | XSExpand of evaluation_step * expansion_step
+
+and parse_result =
+  | ParseDone
+  | ParseError
+  | ParseNull
+  | ParseStmt of stmt
+
+and parse_context =
+  maybe dash_string * maybe stackmark
+
+(**********************************************************************)
+(* SHELL STATE ********************************************************)
+(**********************************************************************)
+
+(* File descriptors *)         
+and fd = nat
+
+(* Paths *)
+and path = string
+
+(* Information for saved FDs during redirect: put in a list to indicate each FD
+   e.g., Map.fromList [(0,Close);(1,Saved 31);(4,Close)] says that:
+     - STDIN was opened for a redirect and should be closed
+     - that STDOUT was saved as fd 31 
+     - STDERR was closed before and should stay closed
+     - fd 3 was closed before and should stay closed
+     - fd 4 was opened for the redirect but should be closed
+ *)
+
+and saved_fd_info = Saved of fd | Close 
+
+and saved_fds = list (fd * saved_fd_info)
+
+(* environments *)       
+and env = Map.map string symbolic_string
+
+and local_opts = <| local_readonly: bool;
+                    local_exported: bool;
+                  |>
+
+and local_env = Map.map string (maybe symbolic_string * local_opts)
+
+and job_stopped = TSTP | STOP | TTIN | TTOU
+
+and job_status = 
+    JobRunning 
+  | JobStopped of job_stopped 
+  | JobTerminated of signal
+  | JobDone of nat
+
+and pipeline_info = list (pid * stmt)
+
+and job_info = <| 
+    id: nat; (* tricky invariant... shouldn't be any dups *)
+    pipeline: pipeline_info;
+    pid: pid;
+    cmd: stmt;
+    status: job_status
+  |>
+
+and history = list (nat * stmt)
+
+and shell_state = <|
+    rootpid: pid;
+    outermost: bool; (* true in top-level shell; false in subshells *)
+    opts: set sh_opt;
+    (* each signal is either:
+         not present (default)
+         ""          (ignore)
+         cmd         (handle)
+    *)
+    traps: map signal symbolic_string;
+    (* for bare trap commands in subshells *)
+    supershell_traps: maybe (map signal symbolic_string);
+    (* tricky invariant with job ids! *)
+    jobs: list job_info;
+    (* $! *)
+    last_pid: maybe pid;
+    (* exit state info *)
+    exit_code : nat;
+    (* there is no explicit stack of params... we use Call stmt as a stack frame 
+       there IS an explicit stack of local variables, for simpler lookup
+     *)
+    positional_params: list symbolic_string; (* $0, $1, $2, $3, ... *)
+    env: env;
+    locals: list local_env;
+    (* offset for use in parsing options like -ab; 
+       inspired by optoff in libdash/src/options.h:42 *)
+    optoff: maybe nat; 
+    readonly: set string;
+    export: set string;
+    funcs: Map.map string stmt;                 
+    aliases: Map.map string string;
+    cwd: string;
+    locale: locale;
+    loop_nest: nat (* for tracking break/continue *);
+    history: history;
+    hashes: Map.map string (path * nat (* hit count *));
+ |>
+
+val STDIN : fd
+val STDOUT : fd
+val STDERR : fd
+let STDIN = 0
+let STDOUT = 1
+let STDERR = 2
+
+(* for sorting the job list *)
+instance (Eq job_info)
+  let (=) job1 job2 = job1.id = job2.id
+  let (<>) job1 job2 = job1.id <> job2.id
+end
+
+instance (Ord job_info)
+  let compare job1 job2 = compare job1.id job2.id
+  let (<) job1 job2 = job1.id < job2.id
+  let (<=) job1 job2 = job1.id <= job2.id
+  let (>) job1 job2 = job1.id > job2.id
+  let (>=) job1 job2 = job1.id >= job2.id
+end
+
+(**********************************************************************)
+(* SYMBOLIC STRING FUNCTIONS ******************************************)
+(**********************************************************************)
+
+val first_is_slash : path -> bool
+let first_is_slash path = 
+  path <> "" && nth path 0 = #'/'
+
+val last_is_slash : path -> bool
+let last_is_slash path = 
+  path <> "" && nth path (stringLength path - 1) = #'/'
+
+val join_path : path -> path -> path
+let join_path root ext = root ^ (if last_is_slash root then "" else "/") ^ ext
+
+val null_sym : sym -> maybe bool
+let null_sym sym =
+  match sym with
+  | SymArith _ -> Just false
+  | SymCommand _ -> Nothing
+  | SymPat _ _ _ _-> Nothing
+  end
+
+val null_char : symbolic_char -> maybe bool
+let null_char c =
+  match c with
+  | C _ -> Just false
+  | Sym sym -> null_sym sym
+  end
+
+val null_string : symbolic_string -> maybe bool
+let rec null_string sym_str = 
+  match sym_str with
+  | [] -> Just true
+  | c::cs ->
+    let only_false mb =
+      match mb with
+      | Just true -> Nothing
+      | Just false -> Just false
+      | Nothing -> Nothing
+      end
+    in
+    match null_char c with
+    | Just true -> only_false (null_string cs)
+    | Just false -> Just false
+    | Nothing -> only_false (null_string cs)
+    end
+  end
+
+val null_fields : fields -> maybe bool
+let rec null_fields fs = 
+  match fs with
+  | [] -> Just true
+  | f::fs -> 
+     match (null_string f, null_fields fs) with
+     | (Just true,  Just true)  -> Just true
+     | (Just false, _)          -> Just false
+     | (_,          Just false) -> Just false
+     | (_,          _)          -> Nothing
+     end
+   end
+
+
+val symbolic_string_of_fields_sep : symbolic_string -> fields -> symbolic_string
+let rec symbolic_string_of_fields_sep sep fs = 
+  match fs with
+  | [] -> []
+  | [f] -> f
+  | f::fs' -> f ++ sep ++ symbolic_string_of_fields_sep sep fs'
+  end
+
+val symbolic_string_of_fields : fields -> symbolic_string
+let symbolic_string_of_fields = symbolic_string_of_fields_sep [C #' ']
+
+val maximal_char_list : symbolic_string -> (list char * symbolic_string)
+let rec maximal_char_list sym_str =
+  match sym_str with
+  | [] -> ([], [])
+  | C c::rest ->
+    let (cs, sym_str') = maximal_char_list rest in
+    (c::cs, sym_str')
+  | Sym _::_ -> ([], sym_str)
+  end
+
+val words_of_symbolic_string : symbolic_string -> words
+let rec words_of_symbolic_string sym_str =
+  match sym_str with
+  | [] -> []
+  | C _::_ ->
+    let (cs, sym_str') = maximal_char_list sym_str in
+    S (toString cs)::words_of_symbolic_string sym_str'
+  | Sym sym::sym_str' -> ESym sym::words_of_symbolic_string sym_str'
+  end
+
+val words_of_fields : fields -> words
+let rec words_of_fields fs = 
+  match fs with
+  | [] -> []
+  | [ss] -> words_of_symbolic_string ss
+  | ss::fs' -> words_of_symbolic_string ss ++ [F] ++ words_of_fields fs'
+  end
+
+val expanded_words_of_symbolic_string : symbolic_string -> expanded_words
+let rec expanded_words_of_symbolic_string sym_str =
+  match sym_str with
+  | [] -> []
+  | C _::_ ->
+    let (cs, sym_str') = maximal_char_list sym_str in
+    ExpS (toString cs)::expanded_words_of_symbolic_string sym_str'
+  | Sym sym::sym_str' -> EWSym sym::expanded_words_of_symbolic_string sym_str'
+  end
+
+val expanded_words_of_fields : fields -> expanded_words
+let rec expanded_words_of_fields fs = 
+  match fs with
+  | [] -> []
+  | [ss] -> expanded_words_of_symbolic_string ss
+  | ss::fs' -> expanded_words_of_symbolic_string ss ++ [UsrF] ++ expanded_words_of_fields fs'
+  end
+
+val symbolic_string_of_char_list : list char -> symbolic_string
+let symbolic_string_of_char_list cs = map C cs
+
+val symbolic_string_of_string : string -> symbolic_string
+let symbolic_string_of_string s = symbolic_string_of_char_list (toCharList s)
+
+val fields_of_symbolic_string : symbolic_string -> fields
+let fields_of_symbolic_string s = [s]
+
+val try_concrete : symbolic_string -> maybe string
+let rec try_concrete vs =
+  match vs with
+  | [] -> Just ""
+  | C(c)::vs' -> 
+     match try_concrete vs' with
+     | Nothing -> Nothing
+     | Just cs -> Just (toString [c] ^ cs)
+     end
+  | Sym _::_ -> Nothing
+  end
+
+val try_concrete_fields : fields -> maybe string
+let rec try_concrete_fields fs =
+  match fs with
+  | [] -> Just ""
+  | [ss] -> try_concrete ss
+  | ss::fs' ->
+     match try_concrete ss with
+     | Nothing -> Nothing
+     | Just s -> 
+        match try_concrete_fields fs' with
+        | Nothing -> Nothing
+        | Just s' -> Just (s ^ " " ^ s')
+        end
+     end
+  end       
+
+val try_concrete_fields_list : fields -> maybe (list string)
+let rec try_concrete_fields_list fs =
+  match fs with
+  | [] -> Just []
+  | ss::fs' -> 
+     match (try_concrete ss, try_concrete_fields_list fs') with
+     | (Just s, Just rest) -> Just (s::rest)
+     | _ -> Nothing
+     end
+  end
+
+val pattern_escs : list char
+let pattern_escs = toCharList "*?["
+
+val heredoc_escs : list char
+let heredoc_escs = toCharList "\\*?["
+                 
+let escape_sc chars sc =
+  match sc with
+  | C c -> if elem c chars then [C #'\\'; C c] else [C c]
+  | _ -> [sc]
+  end
+      
+val escape_quotes : symbolic_string -> symbolic_string
+let escape_quotes ss = concatMap (escape_sc [#'\"'; #'\\'])  ss
+
+val escape_patterns : symbolic_string -> symbolic_string
+let escape_patterns ss = concatMap (escape_sc pattern_escs) ss
+                       
+val unescape_chars : list char -> symbolic_string -> symbolic_string
+let rec unescape_chars escs ss =
+  match ss with
+  | [] -> []
+  | C #'\\'::C c::ss' ->
+     if List.elem c escs
+     then C c::unescape_chars escs ss'
+     else C #'\\'::C c::unescape_chars escs ss'
+  | sc::ss' -> sc::unescape_chars escs ss'
+  end
+
+val unescape_pattern : symbolic_string -> symbolic_string
+let unescape_pattern = unescape_chars pattern_escs
+
+val unescape_tmp_field : tmp_field -> tmp_field
+let unescape_tmp_field tf =
+  match tf with
+  | WFS -> WFS
+  | FS -> FS
+  | Field ss -> Field (unescape_pattern ss)
+  | QField ss -> QField ss
+  end
+
+val unescape_intermediate_fields : intermediate_fields -> intermediate_fields
+let unescape_intermediate_fields = List.map unescape_tmp_field
+
+val unescape_heredoc_field : tmp_field -> tmp_field
+let unescape_heredoc_field tf =
+  match tf with
+  | WFS -> WFS
+  | FS -> FS
+  | Field ss -> Field (unescape_chars heredoc_escs ss)
+  | QField ss -> QField (unescape_chars heredoc_escs ss)
+  end
+
+val unescape_heredoc : intermediate_fields -> intermediate_fields
+let unescape_heredoc = List.map unescape_heredoc_field
+                                 
+val symbolic_string_of_expanded_words 
+    : bool (* for pattern? *) -> expanded_words -> symbolic_string
+let rec symbolic_string_of_expanded_words for_pattern w =
+  match w with
+  | [] -> symbolic_string_of_string ""
+  | UsrF::ws -> symbolic_string_of_string " " ++ symbolic_string_of_expanded_words for_pattern ws
+  | ExpS s::ws -> symbolic_string_of_string s ++ symbolic_string_of_expanded_words for_pattern ws
+  | DQuo ss::ws -> 
+    (* we don't include the quotes, since they'll be ultimately erased anyway! *)
+     (if for_pattern 
+      then [C #'\"'] ++ ss ++ [C #'\"']
+      else ss) ++ symbolic_string_of_expanded_words for_pattern ws
+  | At fs::ws -> 
+     (* we collapse the result of $@ expansion, too. special cased in expand_control *)
+     symbolic_string_of_fields fs ++ symbolic_string_of_expanded_words for_pattern ws
+  | EWSym sym::ws -> Sym sym::symbolic_string_of_expanded_words for_pattern ws
+  | UsrS s::ws -> 
+     let ss = symbolic_string_of_string s in
+     (* when DQuo generates quotes, we want to escape the other quotes *)
+     (if for_pattern then escape_quotes ss else ss) ++ 
+     symbolic_string_of_expanded_words for_pattern ws
+  end
+
+val symbolic_string_of_intermediate_fields : intermediate_fields -> symbolic_string
+let rec symbolic_string_of_intermediate_fields ifs =
+  match ifs with
+  | [] -> []
+  | FS::ifs' -> C #' '::symbolic_string_of_intermediate_fields ifs'
+  | WFS::ifs' -> C #' '::symbolic_string_of_intermediate_fields ifs'
+  | Field s::ifs' -> s ++ symbolic_string_of_intermediate_fields ifs'
+  | QField s::ifs' -> [C #'\"'] ++ s ++ [C #'\"'] ++ 
+                        symbolic_string_of_intermediate_fields ifs'
+  end
+
+val fields_of_expanded_words : expanded_words -> fields
+let fields_of_expanded_words w = [symbolic_string_of_expanded_words false w]
+
+let quoted_chars = toCharList "'\\"
+
+val quote_cl : list char -> list char * bool
+let rec quote_cl cs =
+  match cs with
+  | [] -> ([], false)
+  | c::cs -> 
+     let (cs', needs_quotes) = quote_cl cs in
+     if elem c quoted_chars
+     then (#'\\'::c::cs', true)
+     else (c::cs', needs_quotes || is_whitespace c)
+  end
+
+val quote : string -> string
+let quote s = 
+  let (cs, needs_quotes) = quote_cl (toCharList s) in
+  let s' = toString cs in
+  if needs_quotes then "'" ^ s' ^ "'" else s'
+                                    
+(* Number type helpers *)
+
+val symbolic_string_of_nat : nat -> symbolic_string
+let symbolic_string_of_nat n = symbolic_string_of_string (stringFromNat n)
+
+val integerToFields : integer -> fields
+let integerToFields n = [symbolic_string_of_string (write n)]
+
+val int32ToFields : int32 -> fields
+let int32ToFields n = [symbolic_string_of_string (write n)]
+
+val int64ToFields : int64 -> fields
+let int64ToFields n = [symbolic_string_of_string (write n)]
+
+(**********************************************************************)
+(* AST HELPERS/SMART CONSTRUCTORS *************************************)
+(**********************************************************************)
+
+val is_special_param : string -> bool
+let is_special_param x =
+  match readNat (toCharList x) with
+  | Right _ -> true
+  | Left _ -> elem x ["@"; "*"; "#"; "?"; "-"; "$"; "!"]
+  end
+
+val assigns_of_env : env -> list (string * symbolic_string)
+let assigns_of_env env = map (fun (x,v) -> (x,v)) (Map_extra.toList env)
+
+val sequence : list stmt -> stmt
+let rec sequence stmts =
+  match stmts with
+  | [] -> Done
+  | [stmt] -> stmt
+  | stmt::stmts' -> Semi stmt (sequence stmts')
+end
+
+let default_cmd_opts =
+  <| ran_cmd_subst = false;
+     should_fork = true;
+     force_simple_command = false;
+  |>     
+
+val simple_command : string -> fields -> env -> stmt
+let simple_command cmd args env =
+  CommandReady
+    (assigns_of_env env)
+    (symbolic_string_of_string cmd) args
+    []
+    <| default_cmd_opts with ran_cmd_subst = true |> (* ensure ec is set *)
+
+val skip : stmt
+let skip = simple_command ":" [] Map.empty
+
+val command_eval : symbolic_string -> stmt
+let command_eval cmd = simple_command "eval" [cmd] Map.empty
+
+let string_of_saved_fd (fd,saved_fd_info) =
+  stringFromNat fd ^ "|->" ^
+    match saved_fd_info with
+    | Saved fd' -> stringFromNat fd'
+    | Close -> "-"
+    end
+
+let string_of_saved_fds saved_fds =
+  "[" ^ concat " " (List.map string_of_saved_fd saved_fds) ^ "]"
+
+val pushredir : stmt -> saved_fds -> stmt
+let pushredir stmt saved_fds =
+  if null saved_fds
+  then stmt
+  else Pushredir stmt saved_fds
+
+val with_redirs : stmt -> list expanded_redir -> stmt
+let with_redirs stmt ers =
+  if null ers
+  then stmt
+  else Redir stmt (ers,Nothing,[])
+
+val close_fd_and_then : fd -> stmt -> stmt
+let close_fd_and_then fd stmt =
+  Semi (Pushredir Done [(fd, Close)]) stmt
+
+val try_avoid_fork : stmt -> stmt
+let rec try_avoid_fork stmt =
+  match stmt with
+  | Command assigns args redirs opts ->
+     Command assigns args redirs <| opts with should_fork = false |>
+  | CommandExpArgs assigns exp_args redirs opts ->
+     CommandExpArgs assigns exp_args redirs <| opts with should_fork = false |>
+  | CommandExpRedirs assigns args exp_redirs opts ->
+     CommandExpRedirs assigns args exp_redirs <| opts with should_fork = false |>
+  | CommandExpAssign exp_assigns args saved_fds opts ->
+     CommandExpAssign exp_assigns args saved_fds <| opts with should_fork = false |>
+  | CommandReady assigns cmd args saved_fds opts ->
+     CommandReady assigns cmd args saved_fds <| opts with should_fork = false |>
+  | Redir stmt' redir_state ->
+     Redir (try_avoid_fork stmt') redir_state
+  | _ -> stmt
+  end
+
+val unions : forall 'a. SetType 'a => list (set 'a) -> set 'a
+let unions ss = List.foldr Set.(union) Set.empty ss
+
+val expanded_redir_has_stdin_redir : expanded_redir -> bool
+let expanded_redir_has_stdin_redir er =
+  match er with
+  | ERFile From 0 _ -> true
+  | ERFile FromTo 0 _ -> true
+  | ERDup ToFD _ _ (Just 1) -> true
+  | ERDup FromFD _ 1 (Just _) -> true
+  | ERHeredoc _ 1 _ -> true
+  | _ -> false
+  end
+      
+val is_terminating_control : stmt -> bool
+let is_terminating_control c =
+  match c with
+  | Exit -> true
+  | Return -> true
+  | Break _ -> true
+  | Continue _ -> true
+  | Done -> true
+  | _ -> false
+  end
+
+val combine_redirs : redir_state -> redir_state -> redir_state
+let combine_redirs (ers1, er1, rs1) (ers2, er2, rs2) =
+  let er =
+    match (er1, er2) with
+    | (Nothing, Nothing) -> Nothing
+    | (Just er, Nothing) -> Just er
+    | (Nothing, Just er) -> Just er
+    | (Just  _, Just  _) -> Assert_extra.failwith "couldn't combine two in-flight redirects"
+    end
+  in
+  (ers1 ++ ers2, er, rs1 ++ rs2)
+
+val get_expanding_redir_state : expanding_redir -> expansion_state
+let get_expanding_redir_state er =
+  match er with
+  | XRFile _ _ es -> es
+  | XRDup _ _ es -> es
+  | XRHeredoc _ _ es -> es
+  end
+
+val is_heredoc : expanding_redir -> bool
+let is_heredoc er =
+  match er with
+  | XRFile _ _ _ -> false
+  | XRDup _ _ _ -> false
+  | XRHeredoc _ _ _ -> true
+  end
+
+val set_expanding_redir_state : expansion_state -> expanding_redir -> expanding_redir
+let set_expanding_redir_state es er =
+  match er with
+  | XRFile ty src _ -> XRFile ty src es
+  | XRDup ty src _ -> XRDup ty src es
+  | XRHeredoc ty src _ -> XRHeredoc ty src es
+  end
+
+val parse_source_for_dot : parse_source -> bool
+let parse_source_for_dot src =
+  match src with
+  | ParseFile _ _ -> true
+  | ParseString _ _ -> false
+  | ParseSTDIN -> false
+  end
+
+val parse_source_propagates_control : parse_source -> bool
+let parse_source_propagates_control src =
+  match src with
+  | ParseSTDIN -> true
+  | ParseString ParseEval _ -> true
+  | ParseString ParseTrap _ -> false
+  | ParseFile _ _ -> false
+  end
+
+val is_active_job : job_info -> bool
+let is_active_job job = 
+  match job.status with
+  | JobRunning -> true
+  | JobStopped _ -> true
+  | JobTerminated _ -> false
+  | JobDone _ -> false
+  end
+
+val string_of_job_status : job_status -> string
+let string_of_job_status status =
+  match status with
+  | JobRunning -> "Running"
+  | JobStopped TSTP -> "Stopped (SIGTSTP)"
+  | JobStopped STOP -> "Stopped (SIGSTOP)"
+  | JobStopped TTIN -> "Stopped (SIGTTIN)"
+  | JobStopped TTOU -> "Stopped (SIGTTOU)"
+  | JobTerminated signal -> "Terminated (" ^ string_of_signal signal ^ ")"
+  | JobDone 0 -> "Done"
+  | JobDone code -> "Done (" ^ stringFromNat code ^ ")"
+  end
+
+val cur_prev_jobs : list job_info -> nat * nat
+let cur_prev_jobs jobs = 
+  match jobs with
+  | [] -> (0,0) (* doesn't matter *)
+  | [job] -> (job.id, job.id)
+  | cur::prev::_ -> (cur.id, prev.id)
+  end
+
+val string_of_job_number : nat * nat -> job_info -> string
+let string_of_job_number (cur_id, prev_id) job =
+  "[" ^ stringFromNat job.id ^ "] " ^ 
+    (if job.id = cur_id 
+     then "+" 
+     else if job.id = prev_id
+     then "-"
+     else " ") ^ " "
+
+type jobs_mode = JobsNormal | JobsTerse | JobsLong | JobsFGCommand | JobsBGCommand
+
+let padded_string_of_job_status job =
+  pad_right (string_of_job_status job.status) 25 (* width taken from bash *)
+      
+val ran_command_substitution : expansion_step -> bool
+let rec ran_command_substitution estep =
+  match estep with
+  | ESTilde _s -> false
+  | ESParam _s -> false
+  | ESCommand _s -> true
+  | ESArith _s -> false
+  | ESSplit _s -> false
+  | ESPath _s -> false
+  | ESQuote _s -> false
+  | ESStep _s -> false
+  | ESNested estep_outer estep_inner ->
+     ran_command_substitution estep_outer || 
+     ran_command_substitution estep_inner
+  | ESEval _estep' _step -> true
+  end    
+      
+(**********************************************************************)
+(* PRETTY PRINTING ****************************************************)
+(**********************************************************************)
+
+val string_of_stmt : stmt -> string
+val string_of_words : words -> string
+val string_of_entry : entry -> string
+val string_of_expansion_step : expansion_step -> string
+val string_of_evaluation_step : evaluation_step -> string
+val string_of_symbolic : sym -> string
+val string_of_symbolic_char : symbolic_char -> string
+val char_list_of_symbolic_string : symbolic_string -> list char
+val string_of_symbolic_string : symbolic_string -> string
+val string_of_fields : fields -> string
+
+let braces s = "{ " ^ s ^ " ; }"
+
+(* we translate 
+           cmds... &
+   to
+           { cmds & }
+   this avoids issues with parsing; in particular,
+     cmd1 & ; cmd2 & ; cmd3
+   doesn't parse; it must be:
+     cmd1 & cmd2 & cmd3
+   it's a little too annoying to track "was the last thing
+   backgrounded?" so the braces resolve the issue. testing
+   indicates that they're semantically equivalent.
+*)
+let background s = "{ " ^ s ^ " & }"
+
+let show_unless expected actual =
+  if expected = actual
+  then ""
+  else stringFromNat actual
+
+let string_of_pid pid = stringFromNat pid
+
+val string_of_simple 
+    : forall 'a 'c 'r. 
+      ('a -> string) -> ('c -> string) -> ('r -> string) ->
+      list (string * 'a) -> 'c -> 'r -> string
+let string_of_simple f_a f_c f_r assigns cmds redirs =
+  let s_assigns = concat " " (List.map (fun (v,a) -> v ^ "=" ^ f_a a) assigns) in
+  let s_cmds = f_c cmds in
+  let s_redirs = f_r redirs in
+  spaced_many [s_assigns; s_cmds; s_redirs]
+
+let rec string_of_symbolic sym = 
+  match sym with
+  | SymArith f -> "<<arith(" ^ string_of_fields f ^ ")>>"
+  | SymCommand stmt -> "<<eval(" ^ string_of_stmt stmt ^ ")>>"
+  | SymPat side mode pat s ->
+     "<<pat(" ^ string_of_substring side mode ^ "," 
+              ^ string_of_symbolic_string pat ^ ","
+              ^ string_of_symbolic_string s ^ ")>>"
+  end
+
+and string_of_symbolic_char c =
+  match c with
+  | C c -> toString [c]
+  | Sym sym -> string_of_symbolic sym
+  end
+
+and char_list_of_symbolic_string sym_str =
+  match sym_str with
+  | [] -> []
+  | (C c::cs) -> c::char_list_of_symbolic_string cs
+  | (Sym sym)::cs -> toCharList (string_of_symbolic sym) ++ char_list_of_symbolic_string cs
+  end
+   
+and string_of_symbolic_string sym_str =
+  match sym_str with
+  | [] -> ""
+  | c::cs -> string_of_symbolic_char c ^ string_of_symbolic_string cs
+  end
+
+and string_of_fields fs = 
+  match fs with
+  | [] -> ""
+  | [f] -> string_of_symbolic_string f
+  | f::fs' -> string_of_symbolic_string f ^ " " ^ string_of_fields fs'
+  end
+
+and string_of_stmt c = 
+  match c with
+  | Command assigns cmds redirs _opts ->
+     string_of_simple string_of_words string_of_words string_of_redirs
+       assigns cmds redirs
+  | CommandExpArgs assigns cmds redirs _opts -> 
+     string_of_simple string_of_words string_of_expansion_state string_of_redirs
+       assigns cmds redirs
+  | CommandExpRedirs assigns cmds redir_state _opts ->
+     string_of_simple string_of_words string_of_fields string_of_redir_state
+       assigns cmds redir_state
+  | CommandExpAssign assigns cmds saved_fds _opts -> 
+     string_of_simple string_of_expansion_state string_of_fields (fun _ -> "")
+       assigns cmds saved_fds
+  | CommandReady assigns cmd args saved_fds _opts -> 
+     string_of_simple string_of_symbolic_string string_of_fields (fun _ -> "")
+       assigns (cmd::args) saved_fds
+  | Pipe mode cmds ->
+     let p = concat " | " (List.map string_of_stmt cmds) in
+     if is_bg mode then background p else p
+  | Redir cmd redir_state -> 
+     spaced (string_of_stmt cmd) (string_of_redir_state redir_state)
+  | Background cmd redir_state -> 
+     background (spaced (string_of_stmt cmd) (string_of_redir_state redir_state))
+  | Subshell cmd redir_state ->
+     parens (spaced (string_of_stmt cmd) (string_of_redir_state redir_state))
+  | And cmd1 cmd2 ->
+     string_of_stmt cmd1 ^ " && " ^ string_of_stmt cmd2
+  | Or cmd1 cmd2 ->
+     string_of_stmt cmd1 ^ " || " ^ string_of_stmt cmd2
+  | Semi cmd1 cmd2 ->
+     string_of_stmt cmd1 ^ " ; " ^ string_of_stmt cmd2
+  | Not cmd ->
+     "! " ^ string_of_stmt cmd
+  | If c1 c2 c3 ->
+     string_of_if c1 c2 c3
+  | While c1 c2 -> string_of_while c1 c2
+  | WhileCond c cur body _saved_ec -> 
+     "if " ^ string_of_stmt cur ^ 
+     "; then " ^ string_of_stmt body ^ "; " ^ string_of_while c body ^ "; fi"
+  | WhileRunning c body cur -> 
+     string_of_stmt cur ^ "; " ^ string_of_while c body
+  | For x w c ->
+     "for " ^ x ^ " in " ^ string_of_words w ^ "; do " ^ string_of_stmt c ^ "; done"
+  | ForExpArgs x exp_state body ->
+     "for " ^ x ^ " in " ^ string_of_expansion_state exp_state ^ "; do " ^ 
+       string_of_stmt body ^ "; done"
+  | ForExpanded x f body -> 
+     "for " ^ x ^ " in " ^ string_of_fields f ^ "; do " ^ 
+       string_of_stmt body ^ "; done"
+  | ForRunning x f body cur -> 
+     string_of_stmt cur ^ "; " ^ 
+     "for " ^ x ^ " in " ^ string_of_fields f ^ "; do " ^ string_of_stmt body ^ "; done"
+  | Case w cs ->
+     "case " ^ string_of_words w ^ " in " ^ 
+       concat " " (List.map string_of_case cs) ^ " esac"
+  | CaseExpArg exp cs -> 
+     "case " ^ string_of_expansion_state exp ^ " in " ^ 
+       concat " " (List.map string_of_case cs) ^ " esac"
+  | CaseMatch s cs ->
+     "case " ^ string_of_symbolic_string s ^ " in " ^ 
+       concat " " (List.map string_of_case cs) ^ " esac"
+  | CaseCheckMatch s exp c cs -> 
+     "case " ^ string_of_symbolic_string s ^ " in " ^ 
+       string_of_expansion_state exp ^ ") " ^ string_of_stmt c ^ ";; " ^
+       concat " " (List.map string_of_case cs) ^ " esac"
+  | Defun name cmd -> name ^ "() {\n" ^ string_of_stmt cmd ^ "\n}"
+  | Call _loopnest _argv _f _body c -> string_of_stmt c (* TODO leaving stuff out *)
+  | EvalLoop _linno _ctx (ParseFile _src _push) _i _tl -> ": EvalLoop" (* "source " ^ src *)
+  | EvalLoop _linno _ctx (ParseString ParseEval cmd) _i _tl -> "eval '" ^ cmd ^ "'"
+  | EvalLoop _linno _ctx (ParseString ParseTrap cmd) _i _tl -> "eval '" ^ cmd ^ "' # from trap"
+  | EvalLoop _linno _ctx ParseSTDIN _i _tl -> ": EvalLoop"
+  | EvalLoopCmd _linno _ctx (ParseFile _src _push) _i _tl c -> 
+     string_of_stmt c (* ^ " # in source " ^ src *)
+  | EvalLoopCmd _linno _ctx (ParseString ParseEval cmd) _i _tl c -> 
+     string_of_stmt c ^ " # in eval '" ^ cmd ^ "'"
+  | EvalLoopCmd _linno _ctx (ParseString ParseTrap cmd) _i _tl c -> 
+     string_of_stmt c ^ " # in eval '" ^ cmd ^ "' from trap"
+  | EvalLoopCmd _linno _ctx ParseSTDIN _i _tl c -> 
+     string_of_stmt c
+  | Break n -> "break " ^ show n
+  | Continue n -> "continue " ^ show n
+  | Return -> "return"
+  | Exit -> "exit"
+  | Exec _cmd cmd_argv0 args _env _binsh -> spaced "exec" (string_of_fields (cmd_argv0::args))
+  | Wait n _checked _steps _mode -> "wait " ^ string_of_pid n
+  | Trapped signal _ec c_handler c_cont -> 
+     ": trap on " ^ string_of_signal signal ^ " ; " ^ string_of_stmt c_handler ^ " ; " ^
+     ": end trap ; " ^ string_of_stmt c_cont
+  | CheckedExit c -> ": ignoring errexit ; " ^ string_of_stmt c ^ " ; : resuming errexit"
+  | Pushredir s _saved -> string_of_stmt s (* TODO leaving stuff out *)
+  | Done -> ": Done"
+  end
+
+and string_of_while c body =
+  match c with
+  | Not c' -> "until " ^ string_of_stmt c' ^ "; do " ^ string_of_stmt body ^ "; done "
+  | _ ->  "while " ^ string_of_stmt c ^ "; do " ^ string_of_stmt body ^ "; done "
+  end
+
+and string_of_if c t e =
+  "if " ^ string_of_stmt c ^
+  "; then " ^ string_of_stmt t ^
+  (match e with
+   | Command [] [] [] _ -> "; fi" (* one-armed if *)
+   | If c t e -> "; el" ^ string_of_if c t e
+   | _ -> "; else " ^ string_of_stmt e ^ "; fi"
+   end)
+
+and string_of_case (w,c) =
+  concat "|" (List.map string_of_words w) ^ ") " ^ string_of_stmt c ^ ";;"
+
+and string_of_rfile ty fd =
+  match ty with
+  | To      -> show_unless 1 fd ^ ">"
+  | Clobber -> show_unless 1 fd ^ ">|"
+  | From    -> show_unless 0 fd ^ "<"
+  | FromTo  -> show_unless 0 fd ^ "<>"
+  | Append  -> show_unless 1 fd ^ ">>"
+  end
+
+and string_of_rdup ty fd =
+  match ty with
+  | ToFD -> show_unless 1 fd ^ ">&"
+  | FromFD -> show_unless 0 fd ^ "<&"
+  end
+
+and string_of_heredoc ty fd heredoc =
+  (* TODO 2018-09-04 use sound marker *)
+  let marker = "EOF" in
+  show_unless 0 fd ^ "<<" ^
+  (if ty = XHere then marker else "'" ^ marker ^ "'") ^ "\n" ^ heredoc ^ marker ^ "\n"
+
+and string_of_redir r = 
+  match r with
+  | RFile ty fd a    -> string_of_rfile ty fd ^ string_of_words a
+  | RDup ty fd tgt   -> string_of_rdup ty fd ^ string_of_words tgt
+  | RHeredoc ty fd a -> string_of_heredoc ty fd (string_of_words a)
+  end 
+
+and string_of_expanding_redir exp_redir =
+  match exp_redir with
+  | Nothing -> ""
+  | Just (XRFile ty fd exp_state) -> 
+     string_of_rfile ty fd ^ string_of_expansion_state exp_state
+  | Just (XRDup ty fd exp_state) -> 
+     string_of_rdup ty fd ^ string_of_expansion_state exp_state
+  | Just (XRHeredoc ty fd exp_state) ->
+     string_of_heredoc ty fd (string_of_expansion_state exp_state)
+  end
+
+and string_of_expanded_redir er =
+  match er with
+  | ERFile ty fd a   ->  string_of_rfile ty fd ^ string_of_symbolic_string a
+  | ERDup ty _close_orig fd tgt  -> 
+     string_of_rdup ty fd ^ 
+       match tgt with
+       | Nothing -> "-"
+       | Just fd_tgt -> stringFromNat fd_tgt
+       end
+  | ERHeredoc ty fd a -> string_of_heredoc ty fd (string_of_symbolic_string a)
+  end 
+
+and string_of_expanded_redirs ers =
+  concat " " (List.map string_of_expanded_redir ers)
+and string_of_redirs rs = 
+  concat " " (List.map string_of_redir rs)
+
+and string_of_redir_state (ers, exp_redir, rs) =
+  let s_ers = string_of_expanded_redirs ers in
+  let s_exp_redir = string_of_expanding_redir exp_redir in
+  let s_rs = string_of_redirs rs in
+  spaced_many [s_ers; s_exp_redir; s_rs]
+
+and string_of_tmp_field tf =
+  match tf with
+  | WFS -> " "
+  | FS -> " "
+  | Field s -> string_of_symbolic_string s
+  | QField s -> "\"" ^ string_of_symbolic_string s ^ "\""
+  end
+
+and string_of_intermediate_fields ifs =
+  match ifs with
+  | [] -> ""
+  | tf::ifs' -> string_of_tmp_field tf ^ string_of_intermediate_fields ifs'
+  end
+
+and debug_expanded_words ew =
+  match ew with
+  | [] -> ""
+  | UsrF::ws -> "<UsrF>" ^ debug_expanded_words ws
+  | ExpS s::ws -> "<ExpS(" ^ s ^ ")>" ^ debug_expanded_words ws
+  | DQuo ss::ws -> "<DQuo(" ^ string_of_symbolic_string ss ^ ")>" ^ debug_expanded_words ws
+  | At fs::ws -> "<At(" ^ concat "," (List.map string_of_symbolic_string fs) ^ ")>" ^ debug_expanded_words ws
+  | EWSym sym::ws -> "<EWSym(" ^ string_of_symbolic sym ^ ")>" ^ debug_expanded_words ws
+  | UsrS s::ws -> "<UsrS(" ^ s ^ ")>" ^ debug_expanded_words ws
+  end
+
+and string_of_expanded_words ew = 
+  match ew with
+  | [] -> ""
+  | UsrF::ws -> " " ^ string_of_expanded_words ws
+  | ExpS s::ws -> s ^ string_of_expanded_words ws
+  | DQuo ss::ws -> 
+    (* we don't include the quotes, since they'll be ultimately erased anyway! *)
+     "\"" ^ string_of_symbolic_string ss ^ "\"" ^ string_of_expanded_words ws
+  | At fs::ws -> 
+     (* we collapse the result of $@ expansion, too. special cased in expand_control *)
+     string_of_fields fs ^ string_of_expanded_words ws
+  | EWSym sym::ws -> string_of_symbolic sym ^ string_of_expanded_words ws
+  | UsrS s::ws -> s ^ string_of_expanded_words ws
+  end
+
+and string_of_words w = List.foldr (^) "" (List.map string_of_entry w)
+and string_of_entry e =
+  match e with
+  | S str -> str
+  | ESym _ -> "<<SYMBOLIC>>" (* TODO "R(" ^ string_of_symbolic_string c ^ ")" *)
+  | K code -> string_of_control code
+  | F -> " "
+  end
+
+and string_of_control code =
+  match code with
+  | Tilde user -> "~" ^ user
+  | Param var Normal -> "$" ^ var
+  | Param var Length -> "${#" ^ var ^ "}"
+  | Param var fmt -> "${" ^ var ^ string_of_format fmt ^ "}"
+  | LAssign var ew w -> 
+     "${" ^ var ^ "=" ^ string_of_expanded_words ew ^ string_of_words w ^ "}"
+  | LMatch f _side _mode _ew _w -> string_of_fields f (* TODO leaving stuff out *)
+  | LError var ew w ->
+     "${" ^ var ^ "?" ^ string_of_expanded_words ew ^ string_of_words w ^ "}"
+  | Backtick c -> 
+     "$( " ^ string_of_stmt c ^ " )" (* spaces to prevent arith parsing issues *)
+  | LBacktick c _pid _fd -> "$( " ^ string_of_stmt c ^ " )"
+  | LBacktickWait c _pid _s -> "$( " ^ string_of_stmt c ^ " )"
+  | Arith ew w -> "$(( " ^ string_of_expanded_words ew ^ string_of_words w ^ " ))"
+  | Quote ew w -> "\"" ^ string_of_expanded_words ew ^ string_of_words w ^ "\""
+  end
+
+and string_of_format fmt = 
+  match fmt with
+  | Normal -> "" (* but is special case *)
+  | Length -> "#" (* but is special case *)
+  | Default w -> "-" ^ string_of_words w
+  | NDefault w-> ":-" ^ string_of_words w
+  | Assign w -> "=" ^ string_of_words w
+  | NAssign w -> ":=" ^ string_of_words w
+  | Error w -> "?" ^ string_of_words w
+  | NError w -> ":?" ^ string_of_words w
+  | Alt w -> "+" ^ string_of_words w
+  | NAlt w -> ":+" ^ string_of_words w
+  | Substring side mode w -> string_of_substring side mode ^ string_of_words w
+  end
+
+and string_of_substring side mode =
+  let sym = 
+    match side with
+    | Prefix -> "#" 
+    | Suffix -> "%"
+    end
+  in
+  match mode with
+  | Longest -> sym ^ sym
+  | Shortest -> sym
+  end
+
+and string_of_expansion_state exp_state =
+  match exp_state with
+  | ExpStart _opts w -> string_of_words w
+  | ExpExpand _opts ew w -> string_of_expanded_words ew ^ string_of_words w
+  | ExpSplit _opts ew -> string_of_expanded_words ew
+  | ExpPath _opts ifs -> string_of_intermediate_fields ifs
+  | ExpQuote _opts ifs -> string_of_intermediate_fields ifs
+  | ExpError f -> string_of_fields f
+  | ExpDone f -> string_of_fields f
+  end
+
+and string_of_expansion_step estep =
+  match estep with
+  | ESTilde s -> spaced "Tilde" s
+  | ESParam s -> spaced "Param" s
+  | ESCommand s -> spaced "Command" s
+  | ESArith s -> spaced "Arith" s
+  | ESSplit s -> spaced "Split" s
+  | ESPath s -> spaced "Path" s
+  | ESQuote s -> spaced "Quote" s
+  | ESStep s -> spaced "Step" s
+  | ESNested estep_outer estep_inner ->
+     parens (string_of_expansion_step estep_outer) ^ " " ^
+     parens (string_of_expansion_step estep_inner)
+  | ESEval estep' step ->
+     parens (string_of_expansion_step estep') ^ " " ^
+     parens (string_of_evaluation_step step)
+  end
+
+and string_of_evaluation_step step =
+  match step with
+  | XSSimple s -> spaced "Simple" s
+  | XSPipe s -> spaced "Pipe" s
+  | XSRedir s -> spaced "Redir" s
+  | XSBackground s -> spaced "Background" s
+  | XSSubshell s -> spaced "Subshell" s
+  | XSAnd s -> spaced "And" s
+  | XSOr s -> spaced "Or" s
+  | XSNot s -> spaced "Not" s
+  | XSSemi s -> spaced "Semi" s
+  | XSIf s -> spaced "If" s
+  | XSWhile s -> spaced "While" s
+  | XSFor s -> spaced "For" s
+  | XSCase s -> spaced "Case" s
+  | XSDefun s -> spaced "Defun" s
+  | XSStack s step' -> spaced "Stack" s ^ " " ^ parens (string_of_evaluation_step step')
+  | XSStep s -> spaced "Step" s
+  | XSExec s -> spaced "Exec" s
+  | XSEval linno src s -> 
+     "EvalLoop " ^ stringFromNat linno ^ " " ^ string_of_parse_source src ^ (if s = "" then "" else " " ^ s)
+  | XSWait s -> spaced "Wait" s
+  | XSTrap signal s -> "Trap " ^ spaced (string_of_signal signal) s
+  | XSProc _pid c -> "Proc " ^ string_of_stmt c
+  | XSNested step_outer step_inner -> 
+     parens (string_of_evaluation_step step_outer) ^ " " ^ 
+     parens (string_of_evaluation_step step_inner)
+  | XSExpand step' estep ->
+     parens (string_of_evaluation_step step') ^ " " ^ 
+     parens (string_of_expansion_step estep)
+  end
+
+and string_of_parse_source src =
+  match src with
+  | ParseSTDIN -> "<STDIN>"
+  | ParseString _ cmd -> "'" ^ cmd ^ "'"
+  | ParseFile file _push -> file
+  end
+
+let rec string_of_job_pipeline curjob job pipeline first =
+  match pipeline with
+  | [] -> ""
+  | (pid,stmt)::pipeline' ->
+     (if first then string_of_job_number curjob job else "      ") ^
+     pad_right (stringFromNat pid) 6 ^
+     (if first then padded_string_of_job_status job else toString (replicate 23 #' ') ^ "| ") ^
+     string_of_stmt stmt ^ "\n" ^
+     string_of_job_pipeline curjob job pipeline' false
+  end
+
+let string_of_job mode curjob job = 
+  match mode with
+  | JobsTerse -> stringFromNat job.pid ^ "\n"
+  | JobsFGCommand ->
+     string_of_stmt job.cmd ^ "\n"
+  | JobsBGCommand ->
+     "[" ^ stringFromNat job.id ^ "] " ^
+     string_of_stmt job.cmd ^ "\n"
+  | JobsNormal ->
+     string_of_job_number curjob job ^ 
+     padded_string_of_job_status job ^
+     string_of_stmt job.cmd ^ "\n"
+  | JobsLong -> 
+     string_of_job_pipeline curjob job job.pipeline true
+  end
+
+val nat_of_symbolic_string : symbolic_string -> either string nat
+let nat_of_symbolic_string ss =
+  match try_concrete ss with
+  | Nothing -> Left ("can't parse number in symbolic string '" ^ string_of_symbolic_string ss ^ "'")
+  | Just s -> readNat (toCharList s)
+  end
+
+val split_equal : string -> symbolic_string -> string * maybe symbolic_string
+let rec split_equal var ss =
+  match ss with
+  | [] -> (var, Nothing)
+  | (C #'=')::ss' -> (var, Just ss')
+  | (C c)::ss' -> split_equal (var ^ toString [c]) ss'
+  | _ -> (var ^ string_of_symbolic_string ss, Nothing)
+  end
+
+val try_split_assign : symbolic_string -> string * maybe symbolic_string
+let try_split_assign ss = split_equal "" ss
+
+(* Redirect munging (depends on string converson) *********************)
+
+val try_extract_field : fields -> either string symbolic_string
+let try_extract_field f =
+  match f with
+  | [s] -> Right s
+  | [] -> Left "empty redirect target"
+  | _ -> Left ("redirect target wasn't a single field: '" ^ string_of_fields f ^ "'")
+  end
+
+val try_extract_dup_tgt : symbolic_string -> either string (maybe nat)
+let try_extract_dup_tgt ss =
+  if ss = [C #'-'] 
+  then Right Nothing
+  else match readNat (toCharList (string_of_symbolic_string ss)) with
+       | Left err -> Left ("invalid file descriptor: " ^ err)
+       | Right n -> Right (Just n)
+       end
+
+val try_expand_redir : expanding_redir -> fields -> either string expanded_redir
+let try_expand_redir er f =
+  match (er, try_extract_field f) with
+  | (XRHeredoc ty src _, _) -> Right (ERHeredoc ty src (symbolic_string_of_fields f))
+  | (_, Left err) -> Left err
+  | (XRFile ty src _   , Right ss) -> Right (ERFile ty src ss)
+  | (XRDup ty src _    , Right ss) -> 
+     match try_extract_dup_tgt ss with
+     | Left err -> Left err
+     | Right tgt -> Right (ERDup ty LeaveOrig src tgt)
+     end
+  end
+
+(* Command extraction (depends on string conversion) ******************)
+
+val try_command_name : forall 'a. ('a -> string) -> 'a -> set string
+let try_command_name conv cmds =
+  let str = conv cmds in
+  let cs = toCharList str in
+  let (first, _rest) = break_on_esc false (* not escapable *) #' ' cs in
+  if null first
+  then Set.empty
+  else Set.singleton (toString first)
+
+let try_command_words cmds =
+  match cmds with
+  | S cmd::_ -> cmd
+  | _ -> ""
+  end
+
+let try_command_expanded_words cmds =
+  match cmds with
+  | UsrS cmd::_ -> cmd
+  | ExpS cmd::_ -> cmd
+  | _ -> ""
+  end
+
+let try_command_intermediate_fields cmds =
+  match cmds with
+  | Field cmd::_ -> string_of_symbolic_string cmd
+  | QField cmd::_ -> string_of_symbolic_string cmd
+  | _ -> ""
+  end
+
+let try_command_fields cmds =
+  match cmds with
+  | [] -> ""
+  | cmd::_ -> string_of_symbolic_string cmd
+  end
+
+let try_command_expansion_state es =
+  match es with
+  | ExpStart _eo w -> try_command_words w
+  | ExpExpand _eo [] w -> try_command_words w
+  | ExpExpand _eo e _w -> try_command_expanded_words e
+  | ExpSplit _eo e -> try_command_expanded_words e
+  | ExpPath _eo i -> try_command_intermediate_fields i
+  | ExpQuote _eo i -> try_command_intermediate_fields i
+  | ExpError _ -> ""
+  | ExpDone f -> try_command_fields f
+  end
+
+val collect_command_names : stmt -> set string
+let rec collect_command_names c = 
+  match c with
+  | Command _assigns cmds _redirs _opts -> try_command_name try_command_words cmds
+  | CommandExpArgs _assigns cmds _redirs _opts -> try_command_name string_of_expansion_state cmds
+  | CommandExpRedirs _assigns cmds _redir_state _opts -> try_command_name try_command_fields cmds
+  | CommandExpAssign _assigns cmds _saved_fds _opts -> try_command_name try_command_fields cmds
+  | CommandReady _assigns cmd _args _saved_fds _opts -> Set.singleton (string_of_symbolic_string cmd)
+  | Pipe _mode cmds -> unions (map collect_command_names cmds)
+  | Redir cmd _redir_state -> collect_command_names cmd
+  | Background cmd _redir_state -> collect_command_names cmd
+  | Subshell cmd _redir_state -> collect_command_names cmd
+  | And cmd1 cmd2 -> Set.(union) (collect_command_names cmd1) (collect_command_names cmd2)
+  | Or cmd1 cmd2 -> Set.(union) (collect_command_names cmd1) (collect_command_names cmd2)
+  | Semi cmd1 cmd2 -> Set.(union) (collect_command_names cmd1) (collect_command_names cmd2)
+  | Not cmd -> collect_command_names cmd
+  | If c1 c2 c3 -> unions [collect_command_names c1;
+                           collect_command_names c2;
+                           collect_command_names c3]
+  | While c1 c2 -> Set.(union) (collect_command_names c1) (collect_command_names c2)
+  | WhileCond c cur body _saved_ec -> 
+     unions [collect_command_names c;
+             collect_command_names cur;
+             collect_command_names body]
+  | WhileRunning c body cur -> 
+     unions [collect_command_names c;
+             collect_command_names cur;
+             collect_command_names body]
+  | For _x _w c -> collect_command_names c
+  | ForExpArgs _x _exp_state body -> collect_command_names body
+  | ForExpanded _x _f body -> collect_command_names body
+  | ForRunning _x _f body cur -> 
+     Set.(union) (collect_command_names body) (collect_command_names cur)
+  | Case _w cs -> unions (map (fun (_pat, c) -> collect_command_names c) cs)
+  | CaseExpArg _exp cs -> unions (map (fun (_pat, c) -> collect_command_names c) cs)
+  | CaseMatch _s cs -> unions (map (fun (_pat, c) -> collect_command_names c) cs)
+  | CaseCheckMatch _s _exp c cs -> 
+     unions (map (fun (_pat, c) -> collect_command_names c) (([],c)::cs))
+  | Defun _name cmd -> collect_command_names cmd
+  | Call _loopnest _argv _f body c -> 
+     Set.(union) (collect_command_names body) (collect_command_names c)
+  | EvalLoop _linno _ctx _src _i _tl -> Set.empty
+  | EvalLoopCmd _linno _ctx _src _i _tl c -> collect_command_names c
+  | Break _n -> Set.empty
+  | Continue _n -> Set.empty
+  | Return -> Set.empty
+  | Exit -> Set.empty
+  | Exec cmd _cmd_argv0 _args _env _binsh -> Set.singleton (string_of_symbolic_string cmd)
+  | Wait _n _checked _steps _mode -> Set.empty
+  | Trapped _signal _ec c_handler c_cont -> 
+     Set.(union) (collect_command_names c_handler) (collect_command_names c_cont)
+  | CheckedExit c -> collect_command_names c
+  | Pushredir c _saved -> collect_command_names c
+  | Done -> Set.empty
+  end
+
+(**********************************************************************)
+(* DEFAULT SHELL STATE ************************************************)
+(**********************************************************************)
+
+val getppid : unit -> pid
+declare ocaml target_rep function getppid = `Unix.getppid`
+
+let local_opts_default = 
+  <| local_readonly = false;
+     local_exported = false |>
+
+let env_default : env = 
+  Map.fromList
+    [ ("OPTIND", symbolic_string_of_string "1") 
+    ; ("PPID", symbolic_string_of_nat (getppid ()))
+    ; ("SMOOSH_VERSION", symbolic_string_of_string Version.smoosh_version)
+    ; ("SMOOSH_BUILD", symbolic_string_of_string Version.smoosh_build)
+    ]
+
+let default_shell_state = <|
+      rootpid = 0;
+      outermost = true;
+      opts = Set.empty;
+      traps = Map.empty;
+      supershell_traps = Nothing;
+      jobs = [];
+      exit_code = 0;
+      last_pid = Nothing;
+      positional_params = [symbolic_string_of_string "smoosh"]; (* $0, $1, $2, $3 ... *)
+      env = env_default;
+      locals = [];
+      optoff = Nothing;
+      readonly = Set.empty;
+      export = Set.empty;
+      funcs = Map.empty;
+      aliases = Map.empty;
+      cwd = "/";
+      locale = lc_ambient;
+      loop_nest = 0;
+      history = [];
+      hashes = Map.empty;
+  |>
+

@@ -1,0 +1,2802 @@
+open import Smoosh
+open import Fields
+open import Test
+
+import Debug
+
+val run_command : forall 'a. OS 'a => 
+                  os_state 'a -> 
+                  command_opts ->
+                  checking_mode (* exit status checked elsewhere? *) ->
+                  symbolic_string (* prog *) -> 
+                  fields (* argv *) ->
+                  env ->
+                  either (os_state 'a * string) 
+                         (os_state 'a * stmt * bool (* restore redirs *))
+  
+(* NB that special builtins have to return the restore_redirs bool,
+   but it'll automatically get set to true for everything else.  all
+   of this is a bunch of silliness to properly allow exec its two
+   (rather different) behaviors *)
+
+val is_special_builtin : string -> bool
+let is_special_builtin s =
+  elem s ["break";":";"continue";".";"eval";"exec";"exit";"export";"local";"readonly";
+          "return";"set";"shift";"source";"times";"trap";"unset"]
+
+val is_builtin : string -> bool
+let is_builtin s =
+  elem s ["["; "alias"; "bg"; "cd"; "command"; "echo"; "false"; "fc"; "fg"; 
+          "getopts"; "hash"; "help"; "jobs"; "kill";(*"newgrp";*) "printf"; 
+          "pwd"; "read"; "test"; "true"; "type"; "ulimit"; "umask"; "unalias"; 
+          "wait"]
+
+val builtin_names : list string
+let builtin_names =
+  [ "."
+  ; ":"
+  ; "["
+  ; "alias"
+  ; "bg"
+  ; "break"
+  ; "cd"
+  ; "command"
+  ; "continue"
+  ; "echo"
+  ; "eval"
+  ; "exec"
+  ; "exit"
+  ; "export"
+  ; "false"
+  ; "fc"
+  ; "fg"
+  ; "getopts"
+  ; "hash"
+  ; "history"
+  ; "jobs"
+  ; "kill"
+  ; "local"
+(*  ; "newgrp" *) (* use command *)
+  ; "printf"
+  ; "pwd"
+  ; "read"
+  ; "readonly"
+  ; "return"
+  ; "set"
+  ; "shift"
+  ; "test"
+  ; "times"
+  ; "trap"
+  ; "true"
+  ; "type"
+(*  ; "ulimit" *) (* unimpl *)
+  ; "umask"
+  ; "unalias"
+  ; "unset" 
+  ; "wait"
+  ]
+
+(* INVARIANT: uncomment the ones that we actually implement *)
+val is_unspecified_utility : string -> bool
+let is_unspecified_utility s =
+  elem s ["alloc";"autoload";"bind";"bindkey";"builtin";"bye";"caller";"cap";
+          "chdir";"clone";"comparguments";"compcall";"compctl";"compdescribe";
+          "compfiles";"compgen";"compgroups";"complete";"compquote";"comptags";
+          "comptry";"compvalues";"declare";"dirs";"disable";"disown";"dosh";
+          "echotc";"echoti";(*"help";*)(*"history";*)"hist";"let";(*"local";*)"login";
+          "logout";"map";"mapfile";"popd";"print";"pushd";"readarray";"repeat";
+          "savehistory";"source";"shopt";"stop";"suspend";"typeset";"whence"]
+       
+let builtin_unimplemented s0 _argv _env = Left (s0,"unimplemented")
+
+(**********************************************************************)
+(* PATH RESOLUTION ****************************************************)
+(**********************************************************************)
+
+val resolve_path_with : (path -> bool) -> list path -> string -> maybe path
+let rec resolve_path_with ok path name = 
+  let attempt altered path' = 
+     if ok altered
+     then Just altered
+     else resolve_path_with ok path' name
+  in
+  match path with
+  | [] -> Nothing
+  | ""::path' -> attempt ("./" ^ name) path' (* 'legacy feature' in PATH per 8.3 *)
+  | pwd::path' -> attempt (join_path pwd name) path'
+  end
+
+val command_path_ok : forall 'a. OS 'a => os_state 'a -> path -> bool
+let command_path_ok s0 path =
+  file_exists s0 path && file_type_follow s0 path = Just FileRegular
+
+val resolve_command_name_in_path 
+    : forall 'a. OS 'a =>
+        os_state 'a -> path (* PATH *) -> string (* program *) -> os_state 'a * maybe string
+val resolve_command_name : forall 'a. OS 'a =>
+                           os_state 'a -> string -> os_state 'a * maybe string
+
+let resolve_command_name_in_path s0 path prog =
+  if elem #'/' (toCharList prog)
+  then 
+    (* If the command name contains at least one <slash>, the shell
+       shall execute the utility in a separate utility environment
+       with actions equivalent to calling the execl() function defined
+       in the System Interfaces volume of POSIX.1-2008 with the path
+       and arg0 arguments set to the command name, and the remaining
+       execl() arguments set to the command arguments (if any) and the
+       null terminator. *)
+    (s0, Just prog)
+  else
+    let (s1, hashed) = hash_lookup s0 (command_path_ok s0) prog in
+    match hashed with
+    | Nothing -> 
+       (* Otherwise, the command shall be searched for using the PATH
+          environment variable as described in XBD Environment Variables *)
+       (* TODO PERFORMANCE 2019-06-21 should pre-split this *)
+       let paths = split_string_on true (* escapable *) #':' path in
+       let m_path = resolve_path_with (command_path_ok s0) paths prog in
+       let s2 = 
+         match m_path with
+         | Nothing -> s1
+         | Just path -> hash_insert s1 prog path
+         end
+       in
+       (s2, m_path)
+    | Just path -> (s1, Just path)
+    end
+
+let resolve_command_name s0 prog =
+  resolve_command_name_in_path s0 (get_path s0) prog
+
+(* Checks whether it's okay to call execve. 
+   If not, this function will emit an appropriate error message and set the ec. *) 
+val check_execve : forall 'a. OS 'a =>
+                   maybe string -> (* prefix for error messages *)
+                   os_state 'a ->
+                   string ->
+                   os_state 'a * maybe string (* nothing means failure *)
+let check_execve mpfx s0 prog =
+  let prefix = 
+    match mpfx with
+    | Nothing -> ""
+    | Just pfx -> pfx ^ ": "
+    end
+  in
+  let (s1, m_path) = resolve_command_name s0 prog in
+  match m_path with
+  | Nothing -> 
+     (* If the search is unsuccessful, the command shall
+        fail with an exit status of 127 and the shell
+        shall write an error message. *)
+     let s2 = write_stderr (prefix ^ prog ^ ": command not found\n") s1 in
+     (exit_with 127 s2, Nothing)
+  | Just executable ->
+     if file_exists s1 executable
+     then if is_executable s1 executable
+          then (s1, Just executable)
+          else
+            let s2 = write_stderr (prefix ^ executable ^ ": command not executable\n") s1 in
+            (exit_with 126 s2, Nothing)
+     else 
+       let s2 = write_stderr (prefix ^ executable ^ ": command not found\n") s1 in
+       (exit_with 127 s2, Nothing)
+  end
+
+val early_hash : forall 'a. OS 'a => os_state 'a -> stmt -> os_state 'a
+let rec early_hash s0 c =
+  let cmds = Set_extra.toList (collect_command_names c) in
+  let path = get_path s0 in
+  (* Resolving the command will do the appropriate hashing if we can find it.
+   *)
+  foldr (fun cmd os -> fst (resolve_command_name_in_path os path cmd)) s0 cmds
+
+(**********************************************************************)
+(* ARGUMENT PROCESSING ************************************************)
+(**********************************************************************)
+
+val strip_double_dash : fields -> fields
+let strip_double_dash argv =
+  match argv with
+  | [C #'-'; C #'-']::argv' -> argv'
+  | _ -> argv
+  end
+
+val getopt : list char -> fields -> maybe (maybe char * fields)
+let rec getopt opts fields =
+  match fields with
+  | [] -> Nothing
+  | arg::fields' ->
+     match try_concrete arg with
+     | Nothing -> Nothing
+     | Just s -> 
+        match toCharList s with
+        | #'-'::#'-'::[] -> Just (Nothing, fields')
+        | #'-'::c::cs -> 
+           if elem c opts
+           then 
+             (* try to support -LP, constructions *)
+             let argrest = 
+               match cs with
+               | [] -> fields'
+               | _ -> ((C #'-')::map C cs)::fields'
+               end in
+             Just (Just c,argrest)
+           else Nothing
+        | _ -> Nothing
+        end
+     end
+   end
+
+val getopts : list char -> fields -> list char * fields
+let rec getopts opts fields = 
+  match getopt opts fields with
+  | Nothing -> ([],fields)
+  | Just (Nothing, fields') ->
+     (* stop! we hit -- or some such *)
+     ([], fields')
+  | Just (Just opt,fields') -> 
+     let (found_opts,fields'') = getopts opts fields' in
+     (* store in reverse order so we can process the list without needing an accumulator *)
+     (found_opts ++ [opt],fields'')
+  end
+
+(**********************************************************************)
+(* PID RESOLUTION *****************************************************)
+(**********************************************************************)
+
+let current_job s0 msg = 
+  match s0.sh.jobs with
+  | [] -> Left (msg ^ ": no such job")
+  | job::_ -> Right job
+  end
+
+let prev_job s0 =
+  match s0.sh.jobs with
+  | [] -> Left "%-: no such job"
+  | [job] -> Right job (* pretend we have a circular buffer! *)
+  | _::job::_ -> Right job
+  end
+
+let find_job s0 pred msg =
+  match filter pred s0.sh.jobs with
+  | [] -> Left (msg ^ ": no such job")
+  | [job] -> Right job (* should only be one! *)
+  | _ -> Left ("ambiguous job spec " ^ msg)
+  end
+
+let job_cmd_cs job = toCharList (string_of_stmt job.cmd)
+
+let job_of_symbolic_string s0 ss =
+  match try_concrete ss with
+  | Nothing -> Left ("couldn't translate symbolic string '" ^ string_of_symbolic_string ss ^ "'")
+  | Just s ->
+     match toCharList s with
+     | #'%'::fmt -> 
+        match fmt with
+        | [#'%'] -> current_job s0 "%%"
+        | [#'+'] -> current_job s0 "%+"
+        | [#'-'] -> prev_job s0
+        | #'?'::cs -> 
+           find_job 
+             s0 
+             (fun job -> isInfixOf cs (job_cmd_cs job)) 
+             ("%?" ^ toString cs)
+        | _ -> match readNat fmt with
+           | Right num -> 
+              find_job 
+                s0 
+                (fun job -> job.id = num) 
+                ("%" ^ stringFromNat num)
+           | Left _ -> 
+              find_job
+                s0 
+                (fun job -> isPrefixOf fmt (job_cmd_cs job))
+                ("%" ^ toString fmt)
+           end
+        end
+     | _ -> Left (s ^ ": no such job")
+     end
+  end
+
+let pid_of_symbolic_string s0 ss =
+  match try_concrete ss with
+  | Nothing -> Left ("couldn't translate symbolic string '" ^ string_of_symbolic_string ss ^ "'")
+  | Just s ->
+     match toCharList s with
+     | #'%'::_ ->
+        if is_monitoring s0
+        then match job_of_symbolic_string s0 ss with
+             | Right job -> Right (job.pid, SignalProcessGroup) (* per dash *)
+             | Left msg -> Left msg
+             end
+        else Left ("no such process " ^ s)
+     | cs -> 
+        let (cs', signal_mode) =
+          match cs with
+          | #'-'::cs' -> (cs', SignalProcessGroup)
+          | _ -> (cs, SignalProcess)
+          end
+        in
+        match readNat cs' with
+        | Left _ -> Left ("Illegal number: " ^ s)
+        | Right pid -> Right (pid, signal_mode)
+        end
+     end
+  end
+
+(**********************************************************************)
+(* SPECIAL BUILTINS ***************************************************)
+(**********************************************************************)
+(* NB special builtins should NEVER use Right combined with a non-zero
+   EC to signal an error; in order to comply with early exit rules in
+   the table in 2.8.1 *)
+
+let builtin_colon s0 _argv _env = Right (exit_with 0 s0, Done, true)
+             
+let builtin_break s0 argv _env =
+  (* "If n is greater than the number of enclosing loops, the
+     outermost enclosing loop shall be exited. If there is no
+     enclosing loop, the behavior is unspecified." *)
+  let try_break wanted_n =
+    let n = if wanted_n <= s0.sh.loop_nest || Set.member Sh_nonlexicalctrl s0.sh.opts
+            then wanted_n
+            else s0.sh.loop_nest
+    in
+    if n <= 0
+    then
+      let s_n = stringFromNat wanted_n in
+      let s1 = log_trace Trace_unspec ("break " ^ s_n ^ " outside of loop") s0 in
+      (* printing here or returning non-0 breaks the POSIX test suite *)
+      Right (exit_with 0 s1, Done, true)
+    else Right (exit_with 0 s0, Break n, true)
+  in
+  match strip_double_dash argv with
+  | [] -> 
+     (* default to just breaking the immediate loop *)
+     try_break 1
+  | [s] -> match readUnsignedInteger 10 (trim (char_list_of_symbolic_string s)) with
+           | Right n -> try_break (toNat n)
+           | Left _ -> Left (s0, string_of_symbolic_string s ^
+                                   ": positive argument required")
+           end
+  | _ -> Left (s0,"too many arguments")
+  end
+
+let builtin_continue s0 argv _env =
+  let try_continue wanted_n =
+    let n = if wanted_n <= s0.sh.loop_nest || Set.member Sh_nonlexicalctrl s0.sh.opts
+            then wanted_n
+            else s0.sh.loop_nest
+    in
+    if n <= 0
+    then
+      let s_n = stringFromNat wanted_n in
+      let s1 = log_trace Trace_unspec ("continue " ^ s_n ^ " outside of loop") s0 in
+      (* printing here or returning non-0 breaks the POSIX test suite *)
+      Right (exit_with 0 s1, Done, true)
+    else Right (exit_with 0 s0, Continue n, true)
+  in
+  match strip_double_dash argv with
+  | [] -> 
+     (* default to just continuing the immediate loop *)
+     try_continue 1
+  | [s] -> match readUnsignedInteger 10 (trim (char_list_of_symbolic_string s)) with
+           | Right n -> try_continue (toNat n)
+           | Left _ -> Left (s0, string_of_symbolic_string s ^
+                                   ": positive numeric argument required")
+           end
+  | _ -> Left (s0, "too many arguments")
+  end
+
+let builtin_exit s0 argv _env =
+  match strip_double_dash argv with
+  | [] -> Right (s0, Exit, true) (* default to exit code of last command *)
+  | [s] -> match readUnsignedInteger 10 (trim (char_list_of_symbolic_string s)) with
+           | Right n -> 
+              if n < 0 || n > 255
+              then Left (s0, write n ^ ": illegal number")
+              else Right (exit_with (toNat n) s0, Exit, true)
+           | Left _ -> Left (s0,string_of_symbolic_string s ^ ": numeric argument required")
+           end
+  | _ -> Left (s0, "too many arguments")
+  end
+
+let builtin_return s0 argv _env =
+  (* 2018-03-2 the present arrangement yields exit code of 1 on error; bash gives 255 for return; dash does 2.
+        unspecified in POSIX docs *)
+  match strip_double_dash argv with
+  | [] -> Right (s0, Return, true) (* just keep the last command's return status *)
+  | [s] -> match readNat (char_list_of_symbolic_string s) with
+           | Right n -> Right (exit_with n s0, Return, true)
+           | Left _ -> Left (s0,string_of_symbolic_string s ^ ": numeric argument required")
+           end
+  | _ -> Left (s0,"too many arguments")
+  end
+
+let builtin_shift s0 argv _env =
+  let n = match strip_double_dash argv with
+    | [] -> Right 1
+    | [s] -> match readNat (char_list_of_symbolic_string s) with
+          | Right n -> Right n
+          | Left _ -> Left (string_of_symbolic_string s ^ ": numeric argument required")
+          end
+    | _  -> Left ("too many arguments")
+    end in 
+  match n with
+  | Left err -> Left (s0,err)
+  | Right n -> 
+     let params = get_function_params s0 in
+     if n > length params
+     then Left (s0, "can't shift that many")
+     else
+       let s1 = set_function_params s0.sh.loop_nest (drop n params) s0 in
+       Right (exit_with 0 s1, Done, true)
+  end
+
+val unset_var : 
+  forall 'a. OS 'a => symbolic_string -> os_state 'a -> either string (os_state 'a)
+let unset_var sx s0 =
+  match try_concrete sx with
+  | Nothing -> Left ("couldn't unset symbolic variable " ^ string_of_symbolic_string sx)
+  | Just x ->
+     if is_readonly x s0
+     then Left (x ^ " is read-only")
+     else if is_special_param x
+     then Left (x ^ " is a special parameter and cannot be unset")
+     else Right (unset_param x s0)
+  end
+
+val unset_fun : 
+  forall 'a. OS 'a => symbolic_string -> (os_state 'a) -> either string (os_state 'a)
+let unset_fun sx s0 =
+  match try_concrete sx with
+  | Nothing -> Left ("couldn't unset symbolic function " ^ string_of_symbolic_string sx)
+  | Just x ->
+     Right <| s0 with sh = <| s0.sh with funcs = Map.delete x s0.sh.funcs |> |>
+  end
+
+let rec unset_mode opts =
+  match opts with
+  | [] -> unset_var
+  | #'f'::_ -> unset_fun
+  | #'v'::_ -> unset_var
+  | _::opts -> unset_mode opts
+  end 
+
+val unset_all : forall 'a. OS 'a =>
+                  (symbolic_string -> os_state 'a -> either string (os_state 'a)) ->
+                  list symbolic_string ->
+                  os_state 'a ->
+                  either (os_state 'a * string) (os_state 'a * stmt * bool)
+let rec unset_all unsetter names s0 =
+  match names with
+  | [] -> Right (exit_with 0 s0, Done, true)
+  | name::names' ->
+     match unsetter name s0 with
+     | Left err -> Left (s0, err)
+     | Right s1 -> unset_all unsetter names' s1
+     end
+  end
+
+let builtin_unset s0 argv _env =
+  let (opts,argv') = getopts [#'f'; #'v'] argv in
+  (* unspec whether to unset a function if no flag is given and no such var.
+     dash doesn't do it; neither will we. *)
+  (* TODO 2018-10-08 detect whether we COULD unset such a function, log unspec *)
+  let unsetter = unset_mode opts in
+  unset_all unsetter argv' s0
+
+let rec show_varlist s0 cmd vs =
+  match vs with
+  | [] -> s0
+  | v::vs' ->
+     let msg = 
+       cmd ^ " " ^ v ^ 
+         match lookup_param s0 v with
+         | Just ss -> "=" ^ quote (string_of_fields ss)
+         | Nothing -> ""
+         end ^
+       "\n"
+     in
+     let s1 = safe_write_stdout "cmd" msg s0 in
+     show_varlist s1 cmd vs'
+  end
+
+val update_varlist : forall 'a. OS 'a => 
+   os_state 'a -> string -> (os_state 'a -> string -> os_state 'a) -> 
+   list symbolic_string -> 
+   either (os_state 'a * string) (os_state 'a * stmt * bool)
+let rec update_varlist s0 cmd update args =
+  match args with
+  | [] -> Right (s0, Done, true)
+  | arg::args' ->
+     let (var,mvalue) = try_split_assign arg in
+     (* first, try to set. if it's readonly, we're borked! *)
+     match mvalue with
+     | Nothing -> 
+        update_varlist (update s0 var) cmd update args'
+     | Just value ->
+        match set_param var value s0 with
+        | Left msg -> Left (s0, msg)
+        | Right s1 -> update_varlist (update s1 var) cmd update args'
+        end
+     end
+  end
+
+let log_null_argv_unspec s0 name argv =
+  if null argv 
+  then log_trace Trace_unspec (name ^ " invoked with no arguments; pretending we got -p") s0
+  else s0
+
+let builtin_export s0 argv _env = 
+  let (opts,argv') = getopts [#'p'] argv in
+  if elem #'p' opts || null argv'
+  then (* print out current export vars *)
+    let s1 = log_null_argv_unspec s0 "export" argv in
+    let vars = Set_extra.toOrderedList (Map.domain (exported_vars s1)) in
+    Right (show_varlist s1 "export" vars, Done, true)
+  else (* mark export and possibly set *)
+    update_varlist s0 "export" set_exported argv'
+
+let builtin_readonly s0 argv _env = 
+  let (opts,argv') = getopts [#'p'] argv in
+  if elem #'p' opts || null argv'
+  then (* print out current readonly vars *)
+    let s1 = log_null_argv_unspec s0 "readonly" argv in
+    let vars = Set_extra.toOrderedList (Map.domain (readonly_vars s1)) in
+    Right (show_varlist s1 "readonly" vars, Done, true)
+  else (* mark readonly and possibly set *)
+    update_varlist s0 "readonly" set_readonly argv'
+
+let rec add_locals os env args =
+  match args with
+  | [] -> Right env
+  | arg::args' ->
+     let (var,mvalue) = try_split_assign arg in
+     if is_readonly var os
+     then Left (var ^ ": readonly variable")
+     else let binding =
+            let opts = 
+              if Set.member Sh_allexport os.sh.opts
+              then <| local_opts_default with local_exported = true |>
+              else local_opts_default
+            in
+            match (mvalue, Map.lookup var env) with
+              (* existing binding! *)
+            | (Nothing, Just (existing, e_opts)) -> 
+               (existing, <| e_opts with 
+                  local_exported = e_opts.local_exported || opts.local_exported |>)
+            | (Nothing, Nothing) -> (Nothing, opts)
+            | (Just value, _) -> (Just value, opts)
+            end
+          in
+          add_locals os (Map.insert var binding env) args'
+  end
+
+let builtin_local s0 argv _env =
+  let s1 = 
+    log_trace Trace_unspec "local is unspecified; treated here as a special-builtin" s0
+  in
+  let (opts,argv') = getopts [#'p'] argv in
+  if elem #'p' opts || null argv'
+  then (* print out current local variables *)
+    let vars = get_locals s1 in
+    Right (show_varlist s1 "local" vars, Done, true)
+  else 
+    match s1.sh.locals with
+    | [] -> Left (s1, "not in a function")
+    | env::locals' ->
+       match add_locals s1 env argv' with
+       | Left err -> Left (s1, err)
+       | Right env' ->
+          Right (<| s1 with sh = <| s1.sh with locals = env'::locals' |> |>,
+                 Done,
+                 true)
+       end
+    end
+
+let builtin_times s0 _argv _env = 
+  let (utime, stime, cutime, cstime) = times s0 in
+  Right (safe_write_stdout "times" 
+           (utime ^ " " ^ stime ^ "\n" ^ cutime ^ " " ^ cstime ^ "\n") s0, 
+         Done,
+         true)
+
+let builtin_eval s0 argv _env = 
+  if null argv
+  then Right (exit_with 0 s0, Done, true)
+  else 
+    (* not required by POSIX, but makes things easier. 
+       avoids QRK_EVALNOOPT in modernish *)
+    let argv' = strip_double_dash argv in
+    let src = ParseString ParseEval (string_of_fields argv') in
+    let sstr = parse_init src in
+    Right (s0, 
+           EvalLoop 1 (sstr, Just (stack_init ())) src 
+             Noninteractive Subsidiary, 
+           true)
+
+let builtin_source argv0 s0 argv _env = 
+  match strip_double_dash argv with
+  | [] -> Left (s0, "usage: " ^ argv0 ^ " filename")
+  | sfile::_ ->
+     match try_concrete sfile with
+     | Nothing -> Left (s0, "couldn't handle symbolic argument " ^ string_of_symbolic_string sfile)
+     | Just file ->
+        let mpath = 
+          if elem #'/' (toCharList file) && file_exists s0 file
+          then if is_readable s0 file
+               then Right file
+               else Left "unreadable"
+          else match lookup_concrete_param s0 "PATH" with
+               | Nothing -> Left "no PATH"
+               | Just pathvar -> 
+                  let paths = split_string_on true (* escapable *) #':' pathvar in
+                  match resolve_path_with (is_readable s0) paths file with
+                  | Nothing -> Left "not found"
+                  | Just path -> Right path
+                  end
+               end in
+        match mpath with
+        | Left msg ->
+          (* If no readable file is found, a non-interactive shell
+             shall abort; an interactive shell shall write a
+             diagnostic message to standard error, but this condition
+             shall not be considered a syntax error. *)
+          Left (s0, file ^ ": " ^ msg)
+        | Right path ->
+          let src = ParseFile path PushFile in
+          let sstr = parse_init src in
+          Right (s0, 
+                 EvalLoop 1 (sstr, Nothing) src Noninteractive Subsidiary, 
+                 true)
+        end
+     end
+  end
+
+let builtin_exec s0 argv env =
+  match strip_double_dash argv with
+  | [] -> 
+     (* one might worry that this ec will override whatever the
+        redirects brought. but there's no way we'd even run the
+        command if the redirs failed!
+
+        we'll exit in a noninteractive shell, or just fail
+        interactively or with command exec 
+      *)
+     Right (exit_with 0 s0, Done, false (* don't restore *))
+  | scmd::args ->
+     match try_concrete scmd with
+     | Nothing -> Left (s0, "couldn't handle symbolic argument " ^ string_of_symbolic_string scmd)
+     | Just cmd ->
+        match check_execve (Just "exec") s0 cmd with
+        | (s1, Nothing) -> Right (s1, Done, true)
+        | (s1, Just executable) -> 
+           let exported = exported_set_vars s1 in
+           (* use env to override exports---impl as Pmap.(union) *)
+           let exec_env = Map.(union) exported env in
+           Right (s1, 
+                  Exec (symbolic_string_of_string executable) scmd args exec_env NoBinSh, 
+                  false (* but it doesn't matter, we'll never return *))
+        end
+     end
+  end
+
+let set_getopt_longopt fields =
+  match fields with
+  | [] -> Nothing (* we handled raw "set -o" already *)
+  | name::fields' ->
+     match try_concrete name with
+     | Nothing -> Nothing
+     | Just longopt -> 
+        match sh_opt_of_longopt longopt with
+        | Nothing -> Nothing
+        | Just opt -> Just (opt, fields')
+        end
+     end
+  end
+
+let set_getopt_shortopt c cs fields =
+  match sh_opt_of_shortopt c with
+  | Nothing -> Nothing
+  | Just opt ->
+    (* support multiple args, as in -xv *)
+    let argrest = 
+      match cs with
+      | [] -> fields
+      | _ -> ((C #'-')::map C cs)::fields
+      end in
+    Just (opt,argrest)
+  end
+
+val set_add_opt : list sh_opt * list sh_opt -> bool -> maybe (sh_opt * fields) -> maybe (maybe (list sh_opt * list sh_opt) * fields * bool)
+let set_add_opt (on,off) add_to_on res =
+  match res with
+  | Nothing -> Nothing
+  | Just (opt, fields) -> 
+     Just (Just (if add_to_on 
+                 then (opt::on,List.delete opt off)
+                 else (List.delete opt on,opt::off)), 
+           fields,
+           false)
+  end
+
+val set_getopt : list sh_opt * list sh_opt -> fields -> maybe (maybe (list sh_opt * list sh_opt) * fields * bool)
+let rec set_getopt opts fields =
+  match fields with
+  | [] -> Just (Nothing, [], false)
+  | arg::fields' ->
+     match try_concrete arg with
+     | Nothing -> Nothing
+     | Just s -> 
+        match toCharList s with
+        | #'-'::#'-'::[] -> Just (Nothing, fields', true)
+        (* - means turn it ON *)
+        | #'-'::#'o'::[] ->
+           set_add_opt opts true (set_getopt_longopt fields')
+        | #'-'::c::cs -> 
+           set_add_opt opts true (set_getopt_shortopt c cs fields')
+        (* + means turn it OFF *)
+        | #'+'::#'o'::[] ->
+           set_add_opt opts false (set_getopt_longopt fields')
+        | #'+'::c::cs -> 
+           set_add_opt opts false (set_getopt_shortopt c cs fields')
+        | _ -> Just (Nothing, arg::fields', true)
+        end
+     end
+   end
+
+val set_getopts : list sh_opt * list sh_opt -> fields -> maybe ((list sh_opt * list sh_opt) * fields * bool)
+let rec set_getopts opts fields = 
+  match set_getopt opts fields with
+  | Nothing -> Nothing (* bad parse is a failure. need explict -- for args *)
+  | Just (Nothing, fields', set_param) ->
+     (* stop! we hit -- or some such 
+        set_param will be true if we have (0 or more) params to set
+      *)
+     Just (opts, fields', set_param)
+  | Just (Just opts',fields',_set_param) -> set_getopts opts' fields'
+  end
+
+let set_showopts s0 show = 
+  let opt_vals = map (fun opt -> (opt, Set.member opt s0.sh.opts)) all_sh_opts in
+  Right (foldl show s0 opt_vals, Done, true)
+
+val string_of_sh_opt_max_len : nat
+let string_of_sh_opt_max_len = 
+  maximum (map (comb stringLength string_of_sh_opt) all_sh_opts)
+
+let builtin_set s0 argv _env =
+  (* set [-abCefhmnuvx] [-o option] [argument...]
+     set [+abCefhmnuvx] [+o option] [argument...]
+     set -- [argument...]
+OR
+     set -o
+OR
+     set +o *)
+  match argv with
+  | [] ->
+     (* dump env *)
+     Right (safe_write_stdout "set" (printable_shell_env s0) s0, Done, true)
+  | [[C #'-']] ->
+     (* OVERFIT
+        See Assertion 105 in section 3.14.11 of standard P1003.3.2/D8.
+
+        Technically, this behavior is unspecified... but this is what
+        the testers want, I guess?  *)
+     Right (unset_sh_opt (unset_sh_opt s0 Sh_xtrace) Sh_verbose, Done, true)
+  | [[C #'-'; C #'o']] -> 
+     (* print in human readable format; following dash *)
+     set_showopts s0 
+       (fun os (opt,is_set) ->
+         let msg = pad_right (string_of_sh_opt opt) string_of_sh_opt_max_len ^
+                   "\t" ^ if is_set then "on" else "off" in
+         safe_write_stdout "set" (msg ^ "\n") os)
+  | [[C #'+'; C #'o']] -> 
+     (* print in shell readable format *)
+     set_showopts s0 
+       (fun os (opt,is_set) ->
+         match char_of_sh_opt opt with
+         | Nothing -> os
+         | Just c ->
+            let switch = if is_set then #'-' else #'+' in
+            let flag = toString [switch;c] in
+            let msg = "set " ^ flag in
+            safe_write_stdout "set" (msg ^ "\n") os
+         end)
+  | _ ->
+     match set_getopts ([],[]) argv with
+     | Nothing ->
+        (* While an erroneous condition, we don't want to actually
+           exit when set is given a bad option. The standard doesn't
+           say that it's an error, it does say we'll set the
+           ec. Weird. *)
+        Right (fail_with "set: illegal option" s0, Done, true)
+     | Just ((on,off),params,set_param) ->
+        let s1 = foldr (fun opt os -> set_sh_opt os opt) s0 on in
+        let s2 = foldr (fun opt os -> unset_sh_opt os opt) s1 off in
+        (* only update params when they've been given *)
+        let s3 = 
+          if set_param
+          then set_function_params s2.sh.loop_nest (* keep the same *) params s2 
+          else s2
+        in
+        Right (s3, Done, true) 
+     end
+  end
+
+let trap_parse_signal arg =
+  match try_concrete arg with
+  | Nothing -> 
+     Left ("couldn't recognize symbolic signal " ^ string_of_symbolic_string arg)
+  | Just sig_name ->
+     match readNat (toCharList sig_name) with
+     | Right num -> 
+        match signal_of_platform_int num with
+        | Nothing -> Left ("couldn't recognize signal number " ^ sig_name)
+        | Just signal -> Right signal
+        end
+     | Left _    -> 
+        match signal_of_string sig_name with
+        | Nothing -> Left ("couldn't recognize signal " ^ sig_name)
+        | Just signal -> Right signal
+        end
+     end
+  end
+
+let rec trap_parse_signals argv =
+  match argv with
+  | [] -> Right []
+  | arg::argv' -> 
+     match trap_parse_signal arg with
+     | Left err -> Left err
+     | Right signal ->
+        match trap_parse_signals argv' with
+        | Left err -> Left err
+        | Right rest -> Right (signal::rest)
+        end
+     end
+   end
+
+let trap_handle_signal s0 cond handler =
+  if elem cond undefined_traps
+  then log_trace Trace_undef
+         "Setting a trap for SIGKILL or SIGSTOP produces undefined results." 
+         s0
+  else
+    let s1 = update_trap s0 cond handler in
+    handle_signal s1 cond handler
+
+let rec builtin_trap s0 argv _env =
+  (* if we're running a nontrivial command, forget about any supershell traps *)
+  let s1 =
+    if null argv
+    then s0
+    else clear_supershell_traps s0
+  in
+  match strip_double_dash argv with
+  | [] -> 
+     let show (trap,cmd) os =
+       let quoted_cmd = "'" ^ string_of_symbolic_string cmd ^ "'" in
+       let msg = "trap -- " ^ quoted_cmd ^ " " ^ string_of_signal trap in
+       safe_write_stdout "trap" (msg ^ "\n") os
+     in
+     let traps =
+       match s1.sh.supershell_traps with
+       | Nothing -> s1.sh.traps
+       | Just super_traps -> super_traps
+       end
+     in
+     let s2 = foldr show s1 (Map_extra.toList traps) in
+     Right (s2, Done, true)
+  | arg::signals ->
+     match readNat (char_list_of_symbolic_string arg) with
+     | Right _n -> 
+       (* unset n and all other conditions *) 
+        match trap_parse_signals (arg::signals) with
+        | Left err -> Right (fail_with ("trap: " ^ err) s1, Done, true)
+        | Right conds ->
+           let s2 = foldr (fun cond os -> trap_handle_signal os cond Nothing) s1 conds in
+           Right (exit_with 0 s2, Done, true)
+        end
+     | Left _ -> 
+        match (try_concrete arg, trap_parse_signals signals) with
+        | (Nothing, _) -> 
+           Left (s1, "couldn't set symbolic trap: " ^ string_of_symbolic_string arg)
+        | (_, Left err) -> Right (fail_with ("trap: " ^ err) s1, Done, true)
+        | (Just "-", Right conds) ->
+           (* unset conditions *)
+           let s2 = foldr (fun cond os -> trap_handle_signal os cond Nothing) s1 conds in
+           Right (exit_with 0 s2, Done, true)
+        | (Just _, Right conds) ->
+           (* set conditions (if arg is "", we'll ignore it appropriately) *)
+           let s2 = foldr (fun cond os -> trap_handle_signal os cond (Just arg)) s1 conds in
+           Right (exit_with 0 s2, Done, true)
+        end
+     end
+  end
+   
+val special_builtins :
+  forall 'a. OS 'a =>
+    Map.map string 
+      (os_state 'a -> fields (* argv *) -> env -> 
+       either (os_state 'a * string) (os_state 'a * stmt * bool))
+let special_builtins =  
+  Map.fromList
+    [ (".", builtin_source ".")
+    ; (":", builtin_colon)
+    ; ("break", builtin_break)
+    ; ("continue", builtin_continue)
+    ; ("eval", builtin_eval)
+    ; ("exec", builtin_exec)
+    ; ("exit", builtin_exit)
+    ; ("export", builtin_export)
+    ; ("local", builtin_local) (* cheating! *)
+    ; ("readonly", builtin_readonly)
+    ; ("return", builtin_return)
+    ; ("shift", builtin_shift)
+    ; ("source", builtin_source "source")
+    ; ("set", builtin_set)
+    ; ("times", builtin_times)
+    ; ("trap", builtin_trap)
+    ; ("unset", builtin_unset)
+    ]
+
+(**********************************************************************)
+(* ORDINARY BUILTINS **************************************************)
+(**********************************************************************)
+  
+let builtin_true s0 _argv _env = Right (exit_with 0 s0, Done)
+let builtin_false s0 _argv _env = Right (exit_with 1 s0, Done)
+
+type path_mode = Link | Physical
+
+val path_mode : list char -> path_mode
+let rec path_mode opts =
+  match opts with
+  | [] -> Link
+  | #'P'::_ -> Physical
+  | #'L'::_ -> Link
+  | _::opts -> path_mode opts
+  end 
+
+val resolve_path_mode : forall 'a. OS 'a => os_state 'a -> path_mode -> os_state 'a * string
+let resolve_path_mode s0 mode =
+  let (s1, pwd) = 
+    match mode with
+    | Link -> (s0, s0.sh.cwd)
+    | Physical -> 
+       let pwd = physical_cwd s0 in
+       let s1 = <| s0 with sh = <| s0.sh with cwd = pwd |> |> in
+       (s1, pwd)
+    end
+  in
+  (internal_set_param "PWD" (symbolic_string_of_string pwd) s1, pwd)
+
+let builtin_pwd s0 argv _env =
+  let (opts,_argv') = getopts [#'L';#'P'] argv in
+  let mode = path_mode opts in
+  let (s1,pwd) = resolve_path_mode s0 mode in
+  Right (exit_with 0 (safe_write_stdout "pwd" (pwd ^ "\n") s1), Done)
+
+let rec write_many_stdout f s0 =
+  let (s1,_,s) = concretize_fields s0 f in
+  safe_write_stdout "echo" s s1
+
+let builtin_echo s0 argv _env =
+  (* TODO 2018-11-07 backslash escapes *)
+  let (terminator, ss) = match argv with
+    | [C #'-'; C #'n']::argv' -> ("", argv')
+    | _ -> ("\n", argv)
+    end in
+  let s1 = write_many_stdout ss s0 in
+  let s2 = safe_write_stdout "echo" terminator s1 in
+  Right (exit_with 0 s2, Done)
+
+let do_cd s0 mode dir =   
+  let (curpath,need_print) =
+    if first_is_slash dir
+    then
+      (* 3. If the directory operand begins with a <slash> character,
+         set curpath to the operand and proceed to step 7. *)
+      (dir,false)
+    else if dir = "." || dir = ".." || 
+            toString (take 2 (toCharList dir)) = "./" || 
+            toString (take 3 (toCharList dir)) = "../"
+    then 
+      (* 4. If the first component of the directory operand is dot or
+         dot-dot, proceed to step 6. *)
+      (* 6. Set curpath to the directory operand. *)
+      (* onward! *)
+      (dir,false)
+    else 
+  (* 5. Starting with the first pathname in the <colon>-separated
+     pathnames of CDPATH (see the ENVIRONMENT VARIABLES section) if
+     the pathname is non-null, test if the concatenation of that
+     pathname, a <slash> character if that pathname did not end with a
+     <slash> character, and the directory operand names a
+     directory. If the pathname is null, test if the concatenation of
+     dot, a <slash> character, and the operand names a directory. In
+     either case, if the resulting string names an existing directory,
+     set curpath to that string and proceed to step 7. Otherwise,
+     repeat this step with the next pathname in CDPATH until all
+     pathnames have been tested. *)
+      match lookup_concrete_param s0 "CDPATH" with
+      | Nothing -> (dir,false)
+      | Just cdpath -> 
+         let cdpaths = split_string_on true (* escapable *) #':' cdpath in
+         match resolve_path_with (is_dir s0) cdpaths dir with
+         | Nothing -> (dir,false)
+         | Just dir' -> (dir',true)
+         end
+      end
+  in
+  (* 7. If the -P option is in effect, proceed to step 10. If
+     curpath does not begin with a <slash> character, set curpath to
+     the string formed by the concatenation of the value of PWD, a
+     <slash> character if the value of PWD did not end with a
+     <slash> character, and curpath. *)
+  let curpath' = 
+    match mode with
+    | Physical -> Just curpath
+    | Link -> 
+       let curpath'' = 
+         if first_is_slash curpath
+         then curpath 
+         else join_path s0.sh.cwd curpath in
+       (* 8. The curpath value shall then be converted to canonical form
+          as follows, considering each component from beginning to end,
+          in sequence: ... *)
+       canonicalize_path s0 curpath''
+    end in
+  match curpath' with
+  | Nothing -> Left (s0, "illegal path " ^ curpath)
+  | Just curpath'' ->
+     let old = s0.sh.cwd in
+     let (s1,res) = chdir s0 curpath'' in
+     match res with
+     | Nothing -> 
+        let (s2,pwd) = resolve_path_mode s1 mode in (* sets PWD *)
+        let s3 = internal_set_param "OLDPWD" (symbolic_string_of_string old) s2 in
+        let s4 = 
+          if need_print
+          then safe_write_stdout "cd" (pwd ^ "\n") s3
+          else s3
+        in
+        Right (exit_with 0 s4, Done)
+     | Just err -> Left (s1, err)
+     end
+  end
+
+let builtin_cd s0 argv _env = 
+  let (opts,argv') = getopts [#'L';#'P'] argv in
+  let mode = path_mode opts in
+  match argv' with
+  | [] ->
+    match lookup_concrete_param s0 "HOME" with
+    | Nothing -> 
+       (* 1. If no directory operand is given and the HOME environment
+          variable is empty or undefined, the default behavior is
+          implementation-defined and no further steps shall be
+          taken. *)
+       Left (s0, "HOME unset")
+    | Just homedir -> 
+       (* 2. If no directory operand is given and the HOME environment
+          variable is set to a non-empty value, the cd utility shall
+          behave as if the directory named in the HOME environment
+          variable was specified as the directory operand. *)
+       do_cd s0 mode homedir
+    end
+  | (C #'-'::[])::_ -> 
+     (* equivalent to `cd $OLDPWD && pwd` *)
+     match lookup_concrete_param s0 "OLDPWD" with
+     | Nothing -> Left (s0, "can't move back to missing OLDPWD")
+     | Just path -> 
+        match do_cd s0 mode path with
+        | Left (s1,msg) -> Left (s1,msg)
+        | Right (s1, _stmt (* should be Done *)) -> 
+           Right (safe_write_stdout "cd" (path ^ "\n") s1, Done)
+        end
+     end
+  | path::_ -> (* just ignore extra args *) 
+     match try_concrete path with
+     | Nothing -> Left (s0, "can't cd to symbolic path")
+     | Just path -> do_cd s0 mode path
+     end
+  end
+
+(* Once a utility has been searched for and found (either as a result
+   of this specific search or as part of an unspecified shell start-up
+   activity), an implementation may remember its location and need not
+   search for the utility again unless the PATH variable has been the
+   subject of an assignment. If the remembered location fails for a
+   subsequent invocation, the shell shall repeat the search to find
+   the new location for the utility, if any. *)
+let builtin_hash s0 argv _env = 
+  match argv with
+  | [] -> 
+     let msg =
+       if Map.null s0.sh.hashes 
+       then "No commands hashed."
+       else
+         let show (_cmd,(path,hits)) = 
+           pad_left (stringFromNat hits) 4 ^ "\t" ^ path
+         in
+         let header = "hits\tcommand\n" in
+         header ^ concat "\n" (map show (Map_extra.toList s0.sh.hashes))
+     in
+     Right (safe_write_stdout "hash" (msg ^ "\n") s0, Done)
+  | [C #'-'; C #'r']::_ -> Right (clear_hash s0, Done)
+  | _ -> Right (s0, Done)
+  end
+
+type command_type = 
+    CmdSymbolic
+  | CmdSpecial
+  | CmdBuiltin
+  | CmdFunction
+  | CmdAlias of string
+  | CmdPath of string 
+  | CmdKeyword
+  | CmdNotFound
+
+val shell_keywords : list string
+let shell_keywords = ["!"; "{"; "}"; "case"; "do"; "done"; "elif"; "else"; 
+                      "esac"; "fi"; "for"; "if"; "in"; "then"; "until"; "while"]
+
+let command_type s0 path cmd =
+  if List.elem cmd shell_keywords
+  then (s0, CmdKeyword)
+  else if is_special_builtin cmd
+  then (s0, CmdSpecial)
+  else if is_builtin cmd
+  then (s0, CmdBuiltin)
+  else match Map.lookup cmd s0.sh.aliases with
+       | Just mapping -> (s0, CmdAlias mapping)
+       | Nothing ->
+          if Map.member cmd s0.sh.funcs
+          then (s0, CmdFunction)
+          else let (s1, m_path) = resolve_command_name_in_path s0 path cmd in
+               (s1, 
+                match m_path with
+                | Just executable -> CmdPath executable
+                | Nothing -> CmdNotFound
+                end)
+       end
+
+let command_type_symbolic s0 path scmd =
+  match try_concrete scmd with
+  | Nothing -> (s0, CmdSymbolic)
+  | Just cmd -> command_type s0 path cmd
+  end
+
+let concise_command_type ct s_name =
+  let name = string_of_symbolic_string s_name in
+  match ct with
+  | CmdSymbolic -> name ^ "\n"
+  | CmdKeyword -> name ^ "\n"
+  | CmdSpecial -> name ^ "\n"
+  | CmdBuiltin -> name ^ "\n"
+  | CmdFunction -> name ^ "\n"
+  | CmdPath path -> path ^ "\n"
+  | CmdAlias exp -> "alias " ^ name ^ "='" ^ exp ^ "'\n"
+  | CmdNotFound -> ""
+  end 
+
+let human_readable_command_type ct s_name =
+  let msg = 
+    match ct with
+    | CmdSymbolic -> " is a symbolic command"
+    | CmdKeyword -> " is a shell keyword"
+    | CmdSpecial -> " is a special shell builtin"
+    | CmdBuiltin -> " is a shell builtin"
+    | CmdFunction -> " is a shell function"
+    | CmdPath path -> " is " ^ path
+    | CmdAlias exp -> " is an alias for " ^ exp
+    | CmdNotFound -> ": not found"
+    end 
+  in
+  (string_of_symbolic_string s_name) ^ msg ^ "\n"
+
+(* technically part of XSI, but useful *)
+let rec builtin_type s0 argv _env = 
+  match argv with
+  | [] -> Right (s0, Done)
+  | cmd::argv' ->
+     let (s1, ct) = command_type_symbolic s0 (get_path s0) cmd in
+     let msg = human_readable_command_type ct cmd in
+     builtin_type (safe_write_stdout "type" msg s1) argv' _env
+  end
+
+type command_path = CPAmbient | CPDefault
+
+(* TODO 2018-09-17 generate this from `getconf PATH` *)
+let platform_default_path = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+let command_path s0 cp =
+  match cp with
+  | CPAmbient -> get_path s0
+  | CPDefault -> platform_default_path
+  end
+
+type command_mode = CMRun | CMVerbose of bool (* human readable? -v = false; -V = true *)
+
+let command_mode opts =
+  let cp = if elem #'p' opts then CPDefault else CPAmbient in
+  let cm = 
+    if elem #'v' opts
+    then CMVerbose false
+    else if elem #'V' opts
+    then CMVerbose true
+    else CMRun
+  in
+  (cm, cp)
+
+let rec show_commands render s0 path argv =
+  match argv with
+  | [] -> Right (s0, Done)
+  | name::argv' -> 
+     let (s1, ct) = command_type_symbolic s0 path name in
+     let msg = render ct name in
+     let s2 = safe_write_stdout "command" msg s1 in
+     let s3 = 
+       if ct = CmdNotFound 
+       then exit_with 127 s2 
+       else s2
+     in
+     show_commands render s3 path argv'
+  end
+
+val builtin_command : forall 'a. OS 'a => os_state 'a -> fields -> env ->                  
+                      either (os_state 'a * string) (os_state 'a * stmt)
+let builtin_command s0 argv env = 
+  let (opts,argv') = getopts [#'p';#'v';#'V'] argv in
+  let (mode, path) = command_mode opts in
+  match (mode,argv') with
+  | (CMRun, []) -> Right (s0, Done)
+  | (CMRun, cmd::args) -> 
+     Right (s0, 
+            CommandReady (assigns_of_env env) cmd args []
+            <| default_cmd_opts with force_simple_command = true |>)
+  | (CMVerbose human_readable, _) ->
+     show_commands
+       (if human_readable then human_readable_command_type else concise_command_type)
+       (exit_with 0 s0) (* to be overriden later *)
+       (command_path s0 path)
+       argv'
+  end
+
+let umask_fix_flag flag =
+  match flag with
+  | PermR -> Just Read
+  | PermW -> Just Write
+  | PermX -> Just Execute
+  | PermBigX -> Just Execute (* following dash *)
+  | PermS -> Nothing
+  | PermT -> Nothing
+  end
+
+let umask_add_flags who flags perms =
+  perms_for_many 
+    (fun old -> Set.(union) old (Set.mapMaybe umask_fix_flag flags))
+    who
+    perms
+
+let umask_delete_flags who flags perms =
+  perms_for_many 
+    (fun old -> Set.difference old (Set.mapMaybe umask_fix_flag flags))
+    who
+    perms
+
+let rec umask_eval_action who action perms =
+  match action with
+  (** ACTOP **)
+  (* plain + and - do nothing *)
+  | ActOp OpPlus -> perms
+  | ActOp OpMinus -> perms
+  (* plain = resets all of the bits in who *)
+  | ActOp OpEqual -> perms_clear who perms
+  (** ACTPERMS **)                   
+  | ActPerms OpPlus flags -> umask_add_flags who flags perms
+  | ActPerms OpMinus flags -> umask_delete_flags who flags perms
+  | ActPerms OpEqual flags -> umask_add_flags who flags (perms_clear who perms)
+  (** ACTCOPY **)
+  | ActCopy OpPlus src -> 
+     umask_add_flags who (Set.map flag_of_file_perm (perms_who src perms)) perms
+  | ActCopy OpMinus src -> 
+     umask_delete_flags who (Set.map flag_of_file_perm (perms_who src perms)) perms
+  | ActCopy OpEqual src -> 
+     umask_add_flags who 
+       (Set.map flag_of_file_perm (perms_who src perms)) 
+       (perms_clear who perms)
+  end
+
+let rec umask_eval_actions who actions perms =
+  match actions with
+  | [] -> perms
+  | action::actions' -> 
+     let perms' = umask_eval_action who action perms in
+     umask_eval_actions who actions' perms'
+  end
+
+let rec umask_eval_symbolic clauses perms =
+  match clauses with
+  | [] -> perms
+  | (who,actions)::clauses' -> 
+     umask_eval_symbolic clauses' (umask_eval_actions who actions perms)
+  end
+
+let builtin_umask s0 argv _env =
+  let (opts, argv') = getopts [#'S'] argv in
+  match argv' with
+  | [] -> 
+     let umask = get_umask s0 in
+     let umask_str =
+       if elem #'S' opts
+       then 
+         (* If -S is specified, the message shall be in the following
+            format:
+
+           "u=%s,g=%s,o=%s\n", <owner permissions>, <group
+            permissions>, <other permissions>
+
+            where the three values shall be combinations of letters
+            from the set { r, w, x }; the presence of a letter shall
+            indicate that the corresponding bit is clear in the file
+            mode creation mask.  *)
+         string_of_perms (invert_perms umask)
+       else octal_string_of_perms umask in
+     Right (exit_with 0 (safe_write_stdout "umask" (umask_str ^ "\n") s0), Done)
+  | smask::_ ->
+     match try_concrete smask with
+     | Nothing -> Left (s0, "can't set symbolic mask")
+     | Just mask ->
+        (* try to convert the string to an octal number *)
+        match readUnsignedInteger 8 (toCharList mask) with
+        | Right octal ->
+          (* convert the number to permissions *)
+          let new_mask = perms_of_nat (toNat octal) in
+          (* set the permissions *)
+          let s1 = set_umask s0 new_mask in
+          Right (exit_with 0 s1, Done)
+        | Left _ -> 
+           match perms_symbolic_of_string mask with
+           | Left msg -> Left (s0, msg)
+           | Right ps ->
+              (* load the mask and invert to permissions *)
+              let mask = get_umask s0 in
+              let perms = invert_perms mask in
+              (* evaluate the permissions *)
+              let new_perms = umask_eval_symbolic ps perms in
+              (* invert back and set *)
+              let new_mask = invert_perms new_perms in
+              let s1 = set_umask s0 new_mask  in
+              Right (exit_with 0 s1, Done)
+           end
+        end
+     end
+  end
+
+(* just like dash, we'll implement newgrp with the executable;
+   just call 'exec' *)
+let builtin_newgrp s0 argv env = 
+  match builtin_exec s0 (symbolic_string_of_string "newgrp" :: argv) env with
+  | Left err -> Left err
+  | Right (s1, stmt, _) -> Right (s1, stmt)
+  end
+
+let show_alias os (name,mapping) = 
+  safe_write_stdout "alias" (name ^ "=" ^ mapping ^ "\n") os
+
+let rec add_aliases s0 args =
+  match args with
+  | [] -> Right (exit_with 0 s0, Done)
+  | arg::args' ->
+    match try_split_assign arg with
+    | (name, Just smapping) ->
+       match try_concrete smapping with
+       | Nothing -> Left (s0,
+                          "couldn't symbolically alias " ^ name ^ " to " ^ 
+                            string_of_symbolic_string smapping)
+       | Just mapping -> add_aliases (set_alias s0 name mapping) args'
+       end
+    | (name, Nothing) ->
+       match Map.lookup name s0.sh.aliases with
+       | Nothing -> Left (s0, name ^ " not found")
+       | Just mapping ->
+          let s1 = show_alias s0 (name,mapping) in
+          add_aliases s1 args'
+       end
+    end
+  end
+
+let builtin_alias s0 argv _env =
+  match argv with
+  | [] -> 
+     let aliases = Set_extra.toList (Map.toSet s0.sh.aliases) in
+     let s1 = foldl show_alias s0 aliases in
+     Right (exit_with 0 s1, Done)
+  | _ -> add_aliases s0 argv
+  end
+
+let rec remove_aliases s0 names =
+  match names with
+  | [] -> Right (s0, Done)
+  | sname::names' ->
+     match try_concrete sname with
+     | Nothing -> 
+        let s1 = safe_write_stderr ("unalias: can't remove symbolic alias '" ^ 
+                                    string_of_symbolic_string sname ^ "'") s0 in
+        remove_aliases s1 names'
+     | Just name ->
+        let s1 = 
+          if Map.member name s0.sh.aliases
+          then free_alias s0 name
+          else fail_with ("unalias: " ^ name ^ " not found\n") s0
+        in
+        remove_aliases s1 names'
+     end
+  end
+
+let builtin_unalias s0 argv _env = 
+  match argv with
+  | [[C #'-'; C #'a']] ->
+     (* remove all aliases *)
+     let all_aliases = Set_extra.toList (Map.domain s0.sh.aliases) in
+     remove_aliases (exit_with 0 s0) (map symbolic_string_of_string all_aliases)
+  | _ -> remove_aliases (exit_with 0 s0) argv
+  end
+
+(* TODO 2018-10-01
+
+   When a signal for which a trap has been set is received while the
+   shell is waiting for the completion of a utility executing a
+   foreground command, the trap associated with that signal shall not
+   be executed until after the foreground command has completed. When
+   the shell is waiting, by means of the wait utility, for
+   asynchronous commands to complete, the reception of a signal for
+   which a trap has been set shall cause the wait utility to return
+   immediately with an exit status >128, immediately after which the
+   trap associated with that signal shall be taken. *)
+let builtin_wait s0 argv env = 
+  match argv with
+  | [] ->
+     let (s1,jobs) = active_jobs s0 in
+     let waits = List.map (fun job -> Wait job.pid Unchecked Nothing WaitCommand) jobs in
+     (* the skip on the end makes sure we return 0 *)
+     Right (s1, sequence (waits ++ [skip]))
+  | pid::pids' ->
+     match pid_of_symbolic_string s0 pid with
+     | Left msg -> Left (s0, msg)
+     | Right (pid, _) ->
+        (* some indirect recursion... 
+           waitpid in os.lem needs step_eval, which we don't have access to 
+
+           this also gives us the delayed parsing errors that both bash and dash do
+         *)
+        let next = 
+          if null pids'
+          then Wait pid Unchecked Nothing WaitCommand
+          else Semi 
+                 (Wait pid Unchecked Nothing WaitCommand) 
+                 (simple_command "wait" pids' env)
+        in
+        Right (s0, next)
+     end
+  end
+
+let rec jobs_mode opts =
+  match opts with
+  | [] -> JobsNormal
+  | #'l'::_ -> JobsLong
+  | #'p'::_ -> JobsTerse
+  | _::opts' -> jobs_mode opts'
+  end
+
+let rec show_job_specs mode cur_prev specs s0 =
+  match specs with
+  | [] -> Right (exit_with 0 s0, Done)
+  | spec::specs' ->
+     match job_of_symbolic_string s0 spec with
+     | Left msg -> Left (s0, msg)
+     | Right job -> 
+        let s1 = show_job mode cur_prev job s0 in
+        show_job_specs mode cur_prev specs' s1
+     end
+  end
+
+let builtin_jobs s0 argv _env =
+  let (opts,argv') = getopts [#'l';#'p'] argv in
+  let mode = jobs_mode opts in
+  let (s1, jobs) = active_jobs s0 in
+  let cur_prev = cur_prev_jobs jobs in
+  match argv' with
+  | [] -> 
+     let s2 = show_jobs Nothing mode cur_prev jobs s1 in
+     Right (exit_with 0 s2, Done)
+  | _ -> show_job_specs mode cur_prev argv' s1
+  end
+
+let rec read_set_empty_vars s0 vars =
+  match vars with
+  | [] -> Right (s0, Done)
+  | var::vars' ->
+     match set_param var [] s0 with
+     | Left msg -> Left (s0, msg)
+     | Right s1 -> read_set_empty_vars s1 vars'
+     end
+  end
+
+let rec read_assign_vars s0 vars fs =
+  match (vars,fs) with
+  | ([], _) -> Left (s0, "no variables specified")
+  | (_, []) -> read_set_empty_vars s0 vars
+  | ([var], fs) ->
+     match set_param var (symbolic_string_of_fields fs) s0 with
+     | Left msg -> 
+        Left (s0, msg)
+     | Right s1 -> Right (s1, Done)
+     end
+  | (var::vars', ss::fs') ->
+     match set_param var ss s0 with
+     | Left msg -> Left (s0, msg)
+     | Right s1 -> read_assign_vars s1 vars' fs'
+     end
+  end
+
+let builtin_read s0 argv env = 
+  let (opts,argv') = getopts [#'r'] argv in
+  let escapes = if elem #'r' opts then NoEscapes else BackslashEscapes in
+  match try_concrete_fields_list argv' with
+  | Nothing ->
+     Left (s0, "couldn't handle symbolic variable names: " ^ string_of_fields argv)
+  | Just [] -> Left (s0, "no variables specified")
+  | Just vars ->
+     match read_line_fd s0 STDIN escapes with
+     | (s1, ReadError msg) -> Left (s1, msg)
+     | (s1, ReadBlocked pid) -> 
+        Right (s1, 
+               Semi 
+                 (Wait pid Unchecked (Just default_block) WaitInternal)
+                 (simple_command "read" argv env))
+     | (s1, ReadSuccess line hit_eof) ->
+        let trimmed = trimr_one_newline line in
+        let w = [ExpS trimmed] in
+        let ifs = field_splitting s1 w in
+        let f = finalize_fields (combine_fields ifs) in
+        let ec = if read_eof hit_eof then 1 else 0 in
+        read_assign_vars (exit_with ec s1) vars f
+     end
+  end
+
+let builtin_test s0 argv _env = 
+  match try_concrete_fields_list argv with
+  | Nothing ->
+     (* TODO 2018-10-03 handle some symbolics?
+        we could in principle use, e.g., reflexivity on symbolic strings *)
+     Left (s0, "couldn't handle symbolic test expression: " ^ string_of_fields argv)
+  (* shortcut *)
+  | Just [] -> Right (exit_with 1 s0, Done)
+  | Just strs ->
+     match parse_test_expr strs with
+     | Left msg -> 
+        (* we do the error message manually so we can exit with 2 
+           (run_command returning Left will usually exit with 1) *)
+        let s1 = safe_write_stderr ("test: parse error: " ^ msg ^ "\n") s0 in
+        let s2 = exit_with 2 s1 in
+        Right (s2, Done) 
+     | Right expr -> 
+        let result = eval_test_expr s0 expr in
+        Right (exit_with (if result then 0 else 1) s0, Done)
+     end
+  end
+
+let builtin_bracket s0 argv _env =
+  match reverse argv with
+  | [C #']']::rev_argv' ->
+    builtin_test s0 (reverse rev_argv') _env
+  | _ -> Left (s0, "expected matching ']'")
+  end
+
+let ascii_bell = chr 7
+let ascii_formfeed = chr 12
+let ascii_verticaltab = chr 11
+
+let sprintf_esc fmt =
+  match fmt with
+  | #'\\'::fmt' -> ("\\", fmt')
+  | #'a'::fmt' -> (toString [ascii_bell], fmt')
+  | #'b'::fmt' -> ("\b", fmt')
+  | #'f'::fmt' -> (toString [ascii_formfeed], fmt')
+  | #'n'::fmt' -> ("\n", fmt')
+  | #'r'::fmt' -> ("\r", fmt')
+  | #'t'::fmt' -> ("\t", fmt')
+  | #'v'::fmt' -> (toString [ascii_verticaltab], fmt')
+  | d1::d2::d3::fmt' ->
+     if is_octal_digit d1
+     then 
+       let (other_digits,rest) = splitWhile is_octal_digit [d2;d3] in
+       let num_cs = d1::other_digits in
+       match readUnsignedInteger 8 num_cs with
+       | Left msg -> 
+          Assert_extra.failwith ("!!! couldn't read octal digits: " ^ 
+                                   toString num_cs ^ "(" ^ msg ^ ")")
+       | Right n -> (toString [chr (toNat n)], rest ++ fmt')
+       end
+     else (* no octal digits... just write the unrecognized character *)
+       ("\\" ^ toString [d1], d2::d3::fmt')
+  | c::fmt' -> 
+     (* TODO 2019-05-21 unspec *)
+     ("\\" ^ toString [c], fmt')
+  | [] -> ("\\", [])
+  end
+
+(* Each conversion specification is introduced by the <percent-sign> character ( '%' ).
+   After the character '%', the following shall appear in sequence:
+
+The conversion specifiers and their meanings are:
+
+d,i,o,u,x,X
+The integer argument shall be written as signed decimal ( d or i ), unsigned octal ( o ), unsigned decimal ( u ), or unsigned hexadecimal notation ( x and X ). The d and i specifiers shall convert to signed decimal in the style "[-]dddd". The x conversion specifier shall use the numbers and letters "0123456789abcdef" and the X conversion specifier shall use the numbers and letters "0123456789ABCDEF". The precision component of the argument shall specify the minimum number of digits to appear. If the value being converted can be represented in fewer digits than the specified minimum, it shall be expanded with leading zeros. The default precision shall be 1. The result of converting a zero value with a precision of 0 shall be no characters. If both the field width and precision are omitted, the implementation may precede, follow, or precede and follow numeric arguments of types d, i, and u with <blank> characters; arguments of type o (octal) may be preceded with leading zeros.
+
+BUT: The implementation shall not precede or follow output from the d or u conversion specifiers with <blank> characters not specified by the format operand.
+
+BUT: The implementation shall not precede output from the o conversion specifier with zeros not specified by the format operand.
+
+The format operand shall be reused as often as necessary to satisfy the argument operands. Any extra b, c, or s conversion specifiers shall be evaluated as if a null string argument were supplied; other extra conversion specifications shall be evaluated as if a zero argument were supplied. If the format operand contains no conversion specifications and argument operands are present, the results are unspecified.
+
+If a character sequence in the format operand begins with a '%' character, but does not form a valid conversion specification, the behavior is unspecified.
+
+*)
+
+let rec sprintf_format_b fmt args arg s = 
+  match arg with
+  | [] -> (s, fmt, args)
+  | #'\\'::#'c'::_ignored -> 
+     (* '\c', which shall not be written and shall cause printf to
+        ignore any remaining characters in the string operand
+        containing it, any remaining string operands, and any
+        additional characters in the format operand *)
+     (s, [], [])
+  | #'\\'::arg' ->
+     let (esc, arg'') = sprintf_esc arg' in
+     sprintf_format_b fmt args arg'' (s ^ esc)
+  | c::arg' -> sprintf_format_b fmt args arg' (s ^ toString [c])
+  end
+
+type printf_justification = JustifyLeft | JustifyRight
+type printf_padding = PadSpace | PadZero
+
+let printf_padding justify = 
+  match justify with
+  | JustifyLeft -> pad_right_with
+  | JustifyRight -> pad_left_with
+  end
+
+type printf_sign = SignNone | SignSpace | SignAlways
+type printf_spec = <| 
+  justify: printf_justification; (* - or not *)
+  sign: printf_sign; (* +, or ' ' *)
+  alternative: bool; (* # *)
+  padding: printf_padding; (* 0 *)
+  width: maybe nat;
+  precision: maybe nat;
+  |>  
+
+let printf_default_spec =
+  <| justify     = JustifyRight;
+     sign        = SignNone;
+     alternative = false;
+     padding     = PadSpace;
+     width       = Nothing;
+     precision   = Nothing;
+  |>
+
+let rec printf_parse_flags (spec, fmt) =
+  match fmt with
+  | #'-'::fmt' ->
+     printf_parse_flags (<| spec with justify = JustifyLeft;
+                                      padding = PadSpace |>, fmt') 
+  | #' '::fmt' -> printf_parse_flags (<| spec with sign = SignSpace |>,      fmt') 
+  | #'+'::fmt' -> printf_parse_flags (<| spec with sign = SignAlways |>,     fmt') 
+  | #'#'::fmt' -> printf_parse_flags (<| spec with alternative = true |>,    fmt') 
+  | #'0'::fmt' -> 
+     (* If the '0' and '-' flags both appear, the '0' flag shall be
+        ignored. For d, i , o, u, x, and X conversion specifiers, if a
+        precision is specified, the '0' flag shall be ignored. *)
+     if spec.justify = JustifyLeft || 
+        spec.precision <> Nothing
+     then printf_parse_flags (spec,fmt')
+     else printf_parse_flags (<| spec with padding = PadZero |>, fmt')
+  | _ -> (spec, fmt)
+  end
+
+let printf_parse_field_width (spec, fmt) =
+  match parse_nat fmt with
+  | Left _ -> (spec, fmt)
+  | Right (width, fmt') -> (<| spec with width = Just width |>, fmt')
+  end
+
+let printf_parse_precision (spec, fmt) = 
+  match fmt with
+  | #'.'::fmt' ->
+    let (precision, fmt'') = 
+      match parse_nat fmt' with
+      | Left _ -> (0, fmt')
+      | Right (precision, fmt'') -> (precision, fmt'')
+      end
+    in
+    (<| spec with precision = Just precision |>, fmt'')
+  | _ -> (spec, fmt)
+  end
+
+let printf_parse_spec fmt =
+  printf_parse_precision 
+    (printf_parse_field_width 
+       (printf_parse_flags 
+          (printf_default_spec, fmt)))
+
+type printf_numeric = 
+    Decimal of bool (* signed? *) 
+  | Octal 
+  | Hex of bool (* uppercase? *)
+
+let string_of_printf_numeric mode =
+  match mode with
+  | Decimal true -> "%d"
+  | Decimal false -> "%u"
+  | Octal -> "%o"
+  | Hex true -> "%X"
+  | Hex false -> "%x"
+  end
+
+let printf_parse_numeric fmt =
+  match fmt with
+  | #'d'::fmt' -> Just (Decimal true, fmt')
+  | #'i'::fmt' -> Just (Decimal true, fmt')
+  | #'u'::fmt' -> Just (Decimal false, fmt')
+  | #'o'::fmt' -> Just (Octal, fmt')
+  | #'x'::fmt' -> Just (Hex false, fmt')
+  | #'X'::fmt' -> Just (Hex true, fmt')
+  | _ -> Nothing
+  end
+
+let printf_pad_number spec prefix num =
+  let real_width = 
+    match spec.width with
+    | Nothing -> 0
+    | Just width -> width - stringLength prefix
+    end in
+  match spec.padding with
+  | PadSpace -> printf_padding spec.justify #' ' (prefix ^ num) real_width
+  | PadZero -> prefix ^ printf_padding spec.justify #'0' num real_width
+  end
+
+val sprintf_format_numeric : printf_spec -> printf_numeric -> integer -> string
+let sprintf_format_numeric spec mode n =
+  match mode with
+  | Decimal true -> 
+     (* TODO 2018-10-06 UNSPEC spec.alternative *)
+     let sign = 
+       if n < 0 
+       then "-" 
+       else match spec.sign with
+            | SignNone -> ""
+            | SignSpace -> " "
+            | SignAlways -> "+"
+            end in
+     let abs_n = if n < 0 then ~n else n in  
+     printf_pad_number spec sign (unbounded_write_decimal abs_n)
+  | Decimal false -> 
+     printf_pad_number spec "" (unbounded_write_decimal (unbounded_unsigned64 n))
+  | Octal -> 
+    (* TODO 2018-10-06 octal and hex should be unsigned *)
+     let prefix = if spec.alternative then "0" else "" in
+     printf_pad_number spec prefix (unbounded_write_octal (unbounded_unsigned64 n))
+  | Hex upper -> 
+     let prefix = if spec.alternative then "0x" else "" in
+     let num = unbounded_write_hex (unbounded_unsigned64 n) in
+     let res = printf_pad_number spec prefix num in
+     if upper then uppercase res else res
+  end
+
+let printf_concrete_arg args =
+  match args with
+  | [] -> Nothing
+  | arg::args' ->
+     match try_concrete arg with
+     | Nothing -> Just (Nothing, args')
+     | Just s -> Just (Just s, args')
+     end
+  end
+
+val printf_format 
+  : forall 'a. OS 'a => 
+      os_state 'a -> list char -> fields -> os_state 'a * list char * fields
+let printf_format s0 fmt0 args0 =
+  let (spec, fmt1) = printf_parse_spec fmt0 in
+  let string_precision s =
+    match spec.precision with
+    | Nothing -> s
+    | Just width -> toString (take width (toCharList s))
+    end 
+  in
+  (* The results are undefined if there are insufficient arguments for
+     the format. If the format is exhausted while arguments remain,
+     the excess arguments shall be ignored. *)  
+  let sprintf_res = 
+    match (fmt1, printf_parse_numeric fmt1, printf_concrete_arg args0) with
+    | ([], _, _) -> Left ("", "%: missing format character", 1, [], args0)
+    | (#'%'::fmt2, _, _) -> 
+       match fmt0 with
+         (* there shouldn't have been any spec, per
+            http://austingroupbugs.net/view.php?id=1205#c4351
+
+            we can't juse check that we're the default, so we'll look at fmt0,
+            from before we parsed the spec
+          *)
+       | #'%'::_ -> Right ("%", fmt2, args0)
+       | _ -> Left ("", "%: conversion specifications cannot be applied to the %% escape", 1, [], args0)
+       end
+    (* %s *)
+    | (#'s'::fmt2, _, Just (Just s, args1)) -> 
+       Right (string_precision s, fmt2, args1)
+    | (#'s'::fmt2, _, Just (Nothing, args1)) -> 
+       Left ("", "%s: symbolic argument", 2, fmt2, args1)
+    | (#'s'::fmt2, _, Nothing) -> Right ("", fmt2, [])
+ 
+    (* %b *)
+    | (#'b'::fmt2, _, Just (Just s, args1)) -> 
+       let (s,fmt3,args2) = sprintf_format_b fmt2 args1 (toCharList s) "" in
+       Right (string_precision s, fmt3, args2)
+    | (#'b'::fmt2, _, Just (Nothing, args1)) -> 
+       Left ("", "%b: symbolic argument", 2, fmt2, args1)
+    | (#'b'::fmt2, _, Nothing) -> Right ("", fmt2, [])
+
+    (* %c, manually processing args to avoid try_concrete's overapproximation *)
+    | (#'c'::fmt2, _, _) -> 
+       match args0 with
+       | (C c::_)::args1 -> Right (toString [c], fmt2, args1)
+       | [] -> Right ("", fmt2, []) (* unspec, could be null byte *)
+       | _::args1 -> Left ("", "%c: symbolic argument", 2, fmt2, args1)
+       end
+
+    (* numeric *)
+    (* TODO 2019-05-21 The printf utility is required to notify the user
+       when conversion errors are detected while producing numeric output
+     *)
+    | (_, Just (num_mode, fmt2), Just (Just s, args1)) ->
+       match unbounded_read (toCharList s) with
+       | Left msg ->
+          Left (sprintf_format_numeric spec num_mode (fromNat 0),
+                string_of_printf_numeric num_mode ^ ": invalid number: " ^ msg,
+                1,
+                fmt2, args1)
+       | Right n ->
+          Right (sprintf_format_numeric spec num_mode (n : integer), fmt2, args1)
+       end
+    | (_, Just (num_mode, fmt2), Just (Nothing, args1)) ->
+       Left (sprintf_format_numeric spec num_mode (fromNat 0), 
+             string_of_printf_numeric num_mode ^ ": symbolic argument", 
+             2, fmt2, args1)
+    | (_, Just (num_mode, fmt2), Nothing) ->
+       Right (sprintf_format_numeric spec num_mode (fromNat 0), fmt2, [])
+
+    (* unrecognized *)
+    | (c::fmt2, _, _) ->
+       (* TODO 2019-05-21 If a character sequence in the format
+          operand begins with a '%' character, but does not form a
+          valid conversion specification, the behavior is
+          unspecified. *)
+       let f_str = toString [#'%'; c] in
+       Left (f_str, "unrecognized format " ^ f_str, 1, fmt2, args0)
+    end
+  in 
+  (* compute what we'll actually print *)
+  let (s1, ok, s, fmt2, args1) = 
+    match sprintf_res with
+    | Left (s, msg, ec, fmt2, args1) ->
+       let s1 = write_stderr (msg ^ "\n") s0 in
+       (exit_with ec s1, s <> "", s, fmt2, args1)
+    | Right (s, fmt2, args1) -> (s0, true, s, fmt2, args1)
+    end
+  in
+  (* apply padding; numbers should already be padded...
+     in which case this is a noop
+   *)
+  let padded = 
+    match spec.width with
+    | Nothing -> s
+    | Just width -> if ok then printf_padding spec.justify #' ' s width else s
+    end
+  in 
+  (safe_write_stdout "printf" padded s1, fmt2, args1)
+
+(* invariant: called with an exit code of 0, to be changed later *)
+let rec printf_loop s0 orig_fmt orig_args fmt args =
+  match fmt with
+  | [] ->
+     match args with
+     | [] -> Right (s0, Done)
+     | _ ->
+        (* The format operand shall be reused as often as necessary to
+           satisfy the argument operands. Any extra b, c, or s
+           conversion specifiers shall be evaluated as if a null
+           string argument were supplied; other extra conversion
+           specifications shall be evaluated as if a zero argument
+           were supplied. *)
+        if args = orig_args
+        then (* If the format operand contains no conversion
+                specifications and argument operands are present, the
+                results are unspecified.  We'll avoid an infinite loop
+                if we haven't actually consumed an arg.  *)
+          Right (s0, Done) 
+        else 
+          (* We _shouldn't_ need to reset args---if we got here, we
+             consumed at least one arg and the whole process is
+             deterministic. But here we are! *)
+          printf_loop s0 orig_fmt args orig_fmt args
+     end
+  | #'\\'::fmt' ->
+     let (escaped, fmt'') = sprintf_esc fmt' in
+     let s1 = safe_write_stdout "printf" escaped s0 in
+     printf_loop s1 orig_fmt orig_args fmt'' args
+  | #'%'::fmt' -> 
+     let (s1, fmt'', args') = printf_format s0 fmt' args in
+     printf_loop s1 orig_fmt orig_args fmt'' args'
+  | c::fmt' ->
+     let s1 = safe_write_stdout "printf" (toString [c]) s0 in
+     printf_loop s1 orig_fmt orig_args fmt' args
+  end
+
+let builtin_printf s0 argv _env =
+  match argv with
+  | [] -> 
+     Right (fail_with_code 2 "printf: usage printf format [arg...]\n" s0, Done)
+  | sfmt::args ->              
+     match try_concrete sfmt with
+     | Nothing -> Right (fail_with_code 3 "printf: symbolic format string" s0, Done)
+     | Just fmt -> 
+        let fmt_cl = toCharList fmt in
+        printf_loop (exit_with 0 s0) fmt_cl args fmt_cl args
+     end
+  end
+
+(* INVARIANT: call with an exit status of 0, will change if an error occurs *)
+let rec signal_pids s0 signal spids =
+  match spids with
+  | [] -> Right (s0, Done)
+  | ss_pid::spids' ->
+     match pid_of_symbolic_string s0 ss_pid with
+     | Left msg -> Left (s0, msg)
+     | Right (pid, signal_mode) ->
+        let (s1, ok) = signal_pid s0 signal pid signal_mode in
+        let s2 = if not ok then exit_with 1 s1 else s1 in
+        signal_pids s2 signal spids'
+     end
+  end     
+
+let kill_signal_of_num s0 s_signal =
+  match readNat (toCharList s_signal) with
+  | Left   _ -> (s0, Nothing)
+  | Right  0 -> (s0, Just    EXIT)
+  | Right  1 -> (s0, Just SIGHUP)
+  | Right  2 -> (s0, Just SIGINT)
+  | Right  3 -> (s0, Just SIGQUIT)
+  | Right  6 -> (s0, Just SIGABRT)
+  | Right  9 -> (s0, Just SIGKILL)
+  | Right 14 -> (s0, Just SIGALRM)
+  | Right 15 -> (s0, Just SIGTERM)
+  | Right  n -> 
+     match signal_of_platform_int n with
+     | Nothing -> (s0, Nothing)
+     | Just s  ->
+        let s1 = 
+          log_trace Trace_undef
+            "The effects of specifying any signal_number other than those listed below are undefined. [0, 1, 2, 3, 6, 9, 14, 15]" s0 
+        in
+        (s1, Just s)
+     end
+  end
+
+(* 
+  kill -s signal_name pid...
+  kill -l [signal_number | exit_status]
+
+
+XSI
+  kill [-signal_name] pid...
+  kill [-signal_number] pid...
+ *)
+let builtin_kill s0 argv _env = 
+  let usage_msg = "usage: kill [-s signal | -signal] pid ... or kill -l signal" in
+  match argv with
+  | [C #'-'; C #'l']::argv' -> 
+     match argv' with
+     | [] -> 
+        let sorted_signals = 
+          sortBy 
+            (fun s1 s2 -> platform_int_of_signal s1 <= platform_int_of_signal s2) 
+            all_signals 
+        in
+        let names = List.map string_of_signal sorted_signals in
+        let s1 = safe_write_stdout "kill" (concat "\n" names ^ "\n") s0 in
+        Right (exit_with 0 s1, Done)
+     | [ss_num] -> 
+        let s_num = string_of_symbolic_string ss_num in 
+        match readNat (toCharList s_num) with
+        | Left msg -> Left (s0, "non-numeric signal number or exit code '" ^ s_num ^ "'" ^
+                                " (" ^ msg ^ ")")                                  
+        | Right n ->
+           let (signum,was_retval) = if n > 128 then (n - 128,true) else (n,false) in
+           match signal_of_platform_int signum with
+           | Nothing -> 
+              let ec_text = if was_retval then " (from " ^ s_num ^ ")" else "" in
+              Left (s0, stringFromNat signum ^ ec_text ^ " is not a valid signal number")
+           | Just signal -> 
+              let s1 = safe_write_stdout "kill" (string_of_signal signal ^ "\n") s0 in
+              Right (exit_with 0 s1, Done)
+           end
+        end
+     | _ -> Left (s0, usage_msg)
+     end
+  | [C #'-'; C #'s']::argv' -> 
+     match strip_double_dash argv' with
+     | ss_signal::pids ->
+        let (s1, _concretized, s_signal) = concretize s0 ss_signal in
+        match (s_signal, signal_of_string s_signal) with
+        | (_, Just signal) -> signal_pids (exit_with 0 s1) signal pids          
+        | ("0", _) -> signal_pids (exit_with 0 s1) EXIT pids
+        | (_, Nothing) -> Left (s0, "no such signal " ^ s_signal)
+        end
+     | _ -> Left (s0, usage_msg)
+     end
+  | (C #'-'::ss_signal)::argv' -> 
+     let (s1,_concretized,s_signal) = concretize s0 ss_signal in
+     let (s2, m_signal) =
+       match kill_signal_of_num s1 s_signal with
+       | (s2, Nothing) -> (s2, signal_of_string s_signal)
+       | (s2, Just signal) -> (s2, Just signal)
+       end
+     in
+     match m_signal with
+     | Nothing -> Left (s2, "no such signal " ^ s_signal)
+     | Just signal -> signal_pids (exit_with 0 s2) signal (strip_double_dash argv')
+     end
+  | pids -> signal_pids (exit_with 0 s0) SIGTERM (strip_double_dash pids)
+  end
+
+let OPTIND = "OPTIND"
+let OPTARG = "OPTARG"
+let QMARK = symbolic_string_of_string "?"
+
+let getopts_OPTIND os0 =
+  match Map.lookup OPTIND os0.sh.env with
+  | Nothing -> 1
+  | Just ss -> 
+     match nat_of_symbolic_string ss with
+     | Left _ -> 1
+     | Right n -> n
+     end
+  end
+
+let getopts_incr_OPTIND os0 =
+  internal_set_param OPTIND (symbolic_string_of_nat (getopts_OPTIND os0 + 1)) os0
+
+let getopts_incr_optoff os0 =
+  match os0.sh.optoff with
+  | Nothing -> getopts_incr_OPTIND <| os0 with sh = <| os0.sh with optoff = Just 1 |> |>
+  | Just n -> <| os0 with sh = <| os0.sh with optoff = Just (n + 1) |> |>
+  end
+  
+let getopts_reset_optoff os0 =
+  <| os0 with sh = <| os0.sh with optoff = Nothing |> |>
+
+val getopts_maybe_reset_optoff : forall 'a. OS 'a => symbolic_string -> os_state 'a -> os_state 'a
+let getopts_maybe_reset_optoff opt_rest os0 =
+  if null opt_rest
+  then getopts_reset_optoff os0
+  else os0
+
+val getopts_loop : 
+  forall 'a. OS 'a => 
+    os_state 'a -> list char -> string -> nat -> fields -> 
+    either (os_state 'a * string) (os_state 'a * stmt)
+let rec getopts_loop os0 opts optvar ind args =
+  (* when optoff is set, OPTIND (and so ind) will point 1 _past_ where we are *)
+  let optoff_correction = 
+    match os0.sh.optoff with
+    | Nothing -> 0
+    | Just _ -> 1
+    end
+  in
+  match drop (ind - optoff_correction - 1) args with
+  | [C #'-'; C #'-']::_ -> 
+     (* we make sure to increment OPTIND, because -- isn't a param *)
+     Right (exit_with 1 
+              (internal_set_param optvar QMARK 
+                 (getopts_incr_OPTIND 
+                    (getopts_reset_optoff
+                       (unset_param OPTARG os0)))),
+            Done)
+  | (C #'-'::arg_opts)::args' -> 
+     (* use OPTIND/ind and optoff to find out if we have another character *)
+     let (os1, m_c, opt_rest) = 
+       match (os0.sh.optoff, arg_opts) with
+       | (Nothing, C c::opt_rest) ->
+          (getopts_incr_optoff os0, Just c, opt_rest)
+       | (Just n, cs) ->
+          match drop n cs with
+          | [] -> (os0, Nothing, [])
+          | C c::opt_rest -> (getopts_incr_optoff os0, Just c, opt_rest)
+          | _ ->           
+             let os1 = 
+               log_trace Trace_symbolic ("couldn't parse symbolic option '" ^ string_of_symbolic_string arg_opts ^ "'") os0 
+             in
+             (os1, Nothing, [])
+          end
+       | _ ->
+          let os1 = 
+            log_trace Trace_symbolic ("couldn't parse symbolic option '" ^ string_of_symbolic_string arg_opts ^ "'") os0 
+          in
+          (os1, Nothing, [])
+       end in
+     match m_c with
+     | Nothing -> 
+        (* the index pushed past the end; move on *)
+        getopts_loop (getopts_reset_optoff os1) opts optvar ind args
+     | Just c ->
+        (* got a character. see if we can parse it from the options *)
+        let os2 =
+          if is_alphanumeric c
+          then os1
+          else log_trace Trace_unspec "The use of other option characters that are not alphanumeric produces unspecified results." os1
+        in
+        let s_opt = toString [c] in
+        let ss_opt = symbolic_string_of_string s_opt in
+        match elemIndex c opts with
+        | Nothing -> 
+           let os3 = 
+             (* If an option character not contained in the optstring
+                operand is found where an option character is
+                expected, the shell variable specified by name shall
+                be set to the <question-mark> ( '?' ) character. In
+                this case, if the first character in optstring is a
+                <colon> ( ':' ), the shell variable OPTARG shall be
+                set to the option character found, but no output shall
+                be written to standard error; otherwise, the shell
+                variable OPTARG shall be unset and a diagnostic
+                message shall be written to standard error. *)
+             if index opts 0 = Just #':'
+             then internal_set_param OPTARG ss_opt os2
+             else
+               let os3 = safe_write_stderr ("illegal option -- '" ^ s_opt ^ "'\n") os2 in
+               getopts_maybe_reset_optoff opt_rest (unset_param OPTARG os3)
+           in
+           Right (exit_with 0 (internal_set_param optvar QMARK os3), Done)
+        | Just n ->
+           (* set the specified variable *)
+           let os3 = unset_param OPTARG (internal_set_param optvar ss_opt os2) in
+           (* check to see if we need to set OPTARG *)
+           if index opts (n+1) = Just #':'
+           then 
+             (* try to pull an argument from the rest of the option, e.g., -b5 uses 5 as the arg
+                failing that, get it from the args
+              *)
+             let os4 =
+               match (opt_rest,args') with
+               | ([],[]) -> 
+                  (* If the first character of optstring is a <colon>,
+                     the shell variable specified by name shall be set
+                     to the <colon> character and the shell variable
+                     OPTARG shall be set to the option character
+                     found. *)
+                  if index opts 0 = Just #':'
+                  then
+                    internal_set_param OPTARG ss_opt 
+                      (internal_set_param optvar (symbolic_string_of_string ":") os3)
+                  else
+                    let msg = "option requires an argument -- '" ^ s_opt ^ "'\n" in
+                    internal_set_param OPTARG QMARK (safe_write_stderr msg os3)
+               | ([],arg::_) -> 
+                  getopts_incr_OPTIND (internal_set_param OPTARG arg os3)
+               | (_,_) -> internal_set_param OPTARG opt_rest os3
+               end
+             in
+             Right (exit_with 0 (getopts_reset_optoff os4), Done)
+           else Right (exit_with 0 (getopts_maybe_reset_optoff opt_rest os3), Done)
+        end
+     end
+  | _ -> Right (exit_with 1 (internal_set_param optvar QMARK (unset_param OPTARG os0)), Done)
+  end
+
+let builtin_getopts os0 argv _env = 
+  match argv with
+  | ss_optstring::ss_name::argv' ->
+     (* initialize our working info:
+        what's the option string and variable?
+        were args specified, or do we use positional params?
+      *)
+     let (os1, _, optstring) = concretize os0 ss_optstring in
+     let (os2, _, name) = concretize os1 ss_name in
+     let args =
+       match argv' with
+       | [] -> 
+          match os2.sh.positional_params with
+          | [] -> []
+          | _::params -> params
+          end
+       | _ -> argv'
+       end in
+     (* index in and see whether we have an argument *)
+     getopts_loop os2 (toCharList optstring) name (getopts_OPTIND os2) args
+  | _ -> Left (os0, "usage: getopts optstring name [arg...]")
+  end
+
+let send_sigcont os0 cmd_name job bg_mode =
+  let curprev = cur_prev_jobs os0.sh.jobs in
+  let mode = if is_fg bg_mode then JobsFGCommand else JobsBGCommand in
+  let os1 = safe_write_stdout cmd_name (string_of_job mode curprev job) os0 in
+  let (os2, _tc_ok) = if is_fg bg_mode then tc_setfg os0 job.pid else (os1, true) in
+  let (os3, _signal_ok) = signal_pid os2 SIGCONT job.pid SignalProcessGroup in
+  os3
+
+let builtin_fg os0 argv _env = 
+  if not (Set.member Sh_monitor os0.sh.opts)
+  then Left (os0, "job control is disabled")
+  else 
+  let m_job =
+    match argv with
+    | [] -> 
+       match os0.sh.jobs with
+       | [] -> Left "no current job"
+       | job::_ -> Right job
+       end
+    | [ss_spec] -> job_of_symbolic_string os0 ss_spec
+    | _ -> Left "expects just one job spec"
+    end
+  in
+  match m_job with
+  | Left err -> Left (os0, err)
+  | Right job -> 
+     let os1 = send_sigcont os0 "fg" job FG (* call tc_setfg *) in
+     Right (os1, Wait job.pid Unchecked Nothing WaitInternal)
+  end
+
+let jobs_of_argv os0 argv =
+  let specs = List.map (job_of_symbolic_string os0) argv in
+  let (errors, jobs) = collect_either specs in
+  if null errors && null jobs
+  then match os0.sh.jobs with
+       | [] -> (["no current job"], [])
+       | job::_ -> ([], [job])
+       end
+  else (errors, jobs)
+
+let builtin_bg os0 argv _env = 
+  if not (Set.member Sh_monitor os0.sh.opts)
+  then Left (os0, "job control is disabled")
+  else 
+  let (errors, jobs) = jobs_of_argv os0 argv in
+  match (errors, jobs) with
+  | ([], []) -> Left (os0, "no current job")
+  | (errors, jobs) -> 
+     let os1 = List.foldl (fun os job -> send_sigcont os "bg" job BG) os0 jobs in
+     match errors with
+     | [] -> Right (os1, Done)
+     | _ -> Left (os1, "couldn't parse job specs:\n" ^ concat "\n  " errors)
+     end
+  end
+
+let builtin_help os0 argv _env =
+  let show_list ls os = exit_with 0 (safe_write_stdout "help" (String.concat "\n" ls ^ "\n") os) in
+  match argv with
+  | [] -> 
+     let usage =
+       smoosh_info ^
+       "usage:\n" ^
+       "    help builtins    list implemented builtins\n" ^
+       "    help version     show smoosh version number\n" ^
+       "    help steps       show evaluation steps\n" ^
+       "    help spec        show unspecified/undefined behaviors\n" ^
+       "    help trace       show full trace\n"
+     in
+     Right (exit_with 1 (write_stderr usage os0), Done)
+  | [ss_arg] ->
+     let (os1,_,s_arg) = concretize os0 ss_arg in
+     match s_arg with
+     | "builtins" -> 
+        let os2 = safe_write_stdout "help" "implemented builtins:\n" os1 in
+        Right (show_list builtin_names os2, Done)
+     | "version" -> 
+        let os2 = safe_write_stdout "help" smoosh_info os1 in
+        Right (exit_with 0 os2, Done)
+     | "steps" ->
+        let steps = List.reverseMap string_of_evaluation_step (extract_trace os1) in
+        Right (show_list steps os1, Done)
+     | "trace" ->
+        let trace = List.reverseMap string_of_log_entry os1.log in
+        Right (show_list trace os1, Done)
+     | "spec" ->
+        if in_unspecified_state os1
+        then
+          let steps = List.reverse (extract_unspec os1) in
+          Right (show_list steps os1, Done)
+        else 
+          Right (safe_write_stdout "help" "no unspecified/undefined behavior\n" (exit_with 0 os1), Done)
+     | _ -> Left (os0, "unknown argument: " ^ s_arg)
+     end
+  | _ ->
+     Left (os0, "unknown arguments: " ^ string_of_fields argv)
+  end
+
+(* history *)
+let builtin_history s0 argv _env =
+  (* bash
+history: history [-c] [-d offset] [n] or history -awrn [filename] or history -ps arg [arg...]
+    Display the history list with line numbers.  Lines listed with
+    with a `*' have been modified.  Argument of N says to list only
+    the last N lines.  The `-c' option causes the history list to be
+    cleared by deleting all of the entries.  The `-d' option deletes
+    the history entry at offset OFFSET.  The `-w' option writes out the
+    current history to the history file;  `-r' means to read the file and
+    append the contents to the history list instead.  `-a' means
+    to append history lines from this session to the history file.
+    Argument `-n' means to read all history lines not already read
+    from the history file and append them to the history list.
+    
+    If FILENAME is given, then that is used as the history file else
+    if $HISTFILE has a value, that is used, else ~/.bash_history.
+    If the -s option is supplied, the non-option ARGs are appended to
+    the history list as a single entry.  The -p option means to perform
+    history expansion on each ARG and display the result, without storing
+    anything in the history list.
+    
+    If the $HISTTIMEFORMAT variable is set and not null, its value is used
+    as a format string for strftime(3) to print the time stamp associated
+    with each displayed history entry.  No time stamps are printed otherwise.
+   *)
+  (* yash
+history: manage command history
+
+Syntax:
+	history [-cF] [-d entry] [-s command] [-r file] [-w file] [count]
+
+Options:
+	-c       --clear
+	-d ...   --delete=...
+	-r ...   --read=...
+	-s ...   --set=...
+	-w ...   --write=...
+	-F       --flush-file
+
+Try `man yash' for details.
+   *)
+  match strip_double_dash argv with
+  | [] ->
+     let maxnum = if null s0.sh.history then 0 else maximum (map fst s0.sh.history) in
+     let numwidth = stringLength (stringFromNat maxnum) in
+     let show (num,c) = pad_left (stringFromNat num) numwidth ^ "\t" ^ string_of_stmt c in
+     let msgs = List.reverseMap show s0.sh.history in
+     let s1 = safe_write_stdout "history" (concat "\n" msgs ^ "\n") s0 in
+     Right (exit_with 0 s1, Done)
+  | [[C #'-'; C #'c']] ->
+     Right (exit_with 0 <| s0 with sh = <| s0.sh with history = [] |> |>, Done)
+  | argv' -> Left (s0, "unimplemented option: " ^ string_of_fields argv')
+  end
+
+(* fc [-r] [-e editor] [first [last]]
+   fc -l [-nr] [first [last]]
+   fc -s [old=new] [first] *)
+
+type fc_mode = 
+  | FC_Edit of symbolic_string (* default; -e *)
+  | FC_List                    (* -l *)
+  | FC_NoEdit                  (* -s *)
+
+(* "The value in the FCEDIT variable shall be used as a default when
+   -e is not specified. If FCEDIT is null or unset, ed shall be used
+   as the editor." *)
+val fc_default_mode : forall 'a. OS 'a => os_state 'a -> fc_mode
+let fc_default_mode s0 = 
+  match lookup_string_param s0 "FCEDIT" with
+  | Just ss -> FC_Edit ss
+  | Nothing -> FC_Edit (symbolic_string_of_string "ed")
+  end
+
+val string_of_fc_mode : fc_mode -> string
+let string_of_fc_mode fc_mode =
+  match fc_mode with
+  | FC_Edit ss -> "-e " ^ string_of_symbolic_string ss
+  | FC_List -> "-l"
+  | FC_NoEdit -> "-s"
+  end
+
+type fc_opt =
+  | FC_Reverse  (* -r *)
+  | FC_NoNumber (* -n *)
+
+val string_of_fc_opt : fc_opt -> string
+let string_of_fc_opt fc_opt =
+  match fc_opt with
+  | FC_Reverse -> "-r"
+  | FC_NoNumber -> "-n"
+  end
+
+val fc_optchars : list char
+let fc_optchars = toCharList "elsrn"
+
+val fc_options_loop : fields -> fc_mode -> set fc_opt -> either string (fields * fc_mode * set fc_opt)
+let rec fc_options_loop argv fc_mode fc_opts =
+  match getopt fc_optchars argv with 
+  | Nothing -> Right (argv, fc_mode, fc_opts)
+  | Just (Nothing, argv') -> Right (argv', fc_mode, fc_opts)
+  | Just (Just opt, argv') ->
+     match opt with
+     | #'e' -> 
+        match argv' with
+        | [] -> Left "missing editor after -e"
+        | (C #'-'::weird_editor)::argv'' ->
+           (* handle `fc -er foo` as an error but `fc -e -weirdo` as OK *)
+           let orig_arg = head argv in
+           if orig_arg = C #'-'::C #'e'::weird_editor
+           then Left ("missing editor in grouped option '" ^ 
+                        string_of_symbolic_string orig_arg ^ "'")
+           else fc_options_loop argv'' (FC_Edit weird_editor) fc_opts
+        | editor::argv'' -> fc_options_loop argv'' (FC_Edit editor) fc_opts
+        end
+     | #'l' -> fc_options_loop argv' FC_List fc_opts
+     | #'s' -> fc_options_loop argv' FC_NoEdit fc_opts
+     | #'r' -> fc_options_loop argv' fc_mode (Set.insert FC_Reverse fc_opts)
+     | #'n' -> fc_options_loop argv' fc_mode (Set.insert FC_NoNumber fc_opts)
+     | _ -> Left ("unrecognized option '" ^ toString [opt] ^ "'")
+     end
+  end
+
+type fc_operand =
+  | FC_CmdNumber of nat    (* [+]n *)
+  | FC_Previous of nat     (* -n *)
+  | FC_Matching of string  (* string *)
+
+let string_of_fc_operand op =
+  match op with
+  | FC_CmdNumber n -> "+" ^ stringFromNat n
+  | FC_Previous n -> "~" ^ stringFromNat n
+  | FC_Matching s -> s
+  end
+
+val fc_operand : symbolic_string -> either string fc_operand
+let fc_operand ss_arg =
+  match try_concrete ss_arg with
+  | Nothing -> Left ("couldn't handle symbolic operand '" ^ 
+                       string_of_symbolic_string ss_arg ^ "'")
+  | Just arg -> 
+     match readSignedInteger 10 (toCharList arg) with
+     | Right n -> 
+        if n < 0 
+        then Right (FC_Previous (toNat (~n)))
+        else if n > 0
+        then Right (FC_CmdNumber (toNat n))
+        else (* n == 0 *) Left ("invalid operand '" ^ arg ^ "'")
+     | Left _ -> Right (FC_Matching arg)
+     end
+  end
+
+type fc_noedit_operands = 
+  <| noedit_replace: maybe (string * symbolic_string); noedit_first: fc_operand |>
+
+let fc_noedit_default_operands = <| noedit_replace = Nothing; noedit_first = FC_Previous 1 |>
+
+val fc_noedit_operand : symbolic_string -> fc_noedit_operands -> either string fc_noedit_operands
+let fc_noedit_operand arg ops =
+  match try_split_assign arg with
+  | (_s, Nothing) -> (* no =, must be a real operand *)
+     match fc_operand arg with
+     | Left err -> Left err
+     | Right op -> Right <| ops with noedit_first = op |>
+     end
+  | (s_old, Just s_new) -> Right <| ops with noedit_replace = Just (s_old, s_new) |>
+  end
+
+let fc_noedit_operands argv =
+  match argv with 
+  | [] -> Right fc_noedit_default_operands
+  | [arg] -> fc_noedit_operand arg fc_noedit_default_operands
+  | [arg1; arg2] -> 
+     match fc_noedit_operand arg1 fc_noedit_default_operands with
+     | Left err -> Left err
+     | Right ops -> fc_noedit_operand arg2 ops
+     end
+  | _ -> Left ("expected [old=new] [first], got '" ^ string_of_fields argv ^ "'")
+  end
+
+type fc_editlist_operands = <| editlist_first: fc_operand; editlist_last : fc_operand |>
+
+let fc_editlist_operands list_mode argv =
+  match argv with
+  | [] -> 
+     let first = FC_Previous 1 in
+     let last = if list_mode then FC_Previous 16 else FC_Previous 1 in
+     Right <| editlist_first = first; editlist_last = last |>
+  | [first_arg] ->
+     match fc_operand first_arg with
+     | Left err -> Left err
+     | Right first ->
+        let last = if list_mode then FC_Previous 1 else first in
+        Right <| editlist_first = first; editlist_last = last |>
+     end
+  | [first_arg; last_arg] ->
+     match fc_operand first_arg with
+     | Left err -> Left err
+     | Right first ->
+        match fc_operand last_arg with
+        | Left err -> Left err
+        | Right last -> Right <| editlist_first = first; editlist_last = last |>
+        end
+     end
+  | _ -> Left ("expected [first [last]], got '" ^ string_of_fields argv)
+  end
+
+val fc_matches : string -> stmt -> bool
+let fc_matches s c = isPrefixOf (toCharList s) (toCharList (string_of_stmt c))
+
+(* TODO 2019-07-10 
+When a range of commands is used, it shall not be an error to specify first or last values that are not in the history list; fc shall substitute the value representing the oldest or newest command in the list, as appropriate.
+*)
+(* returns an INDEX into the history along with the entry *)
+val fc_find_matching_entry : fc_operand -> history -> maybe (nat * (nat * stmt))
+let rec fc_find_matching_entry op history =
+  let incr_index = Maybe.map (fun (idx, entry) -> (idx + 1, entry)) in
+  match (op, history) with
+  | (_, []) -> Nothing
+  | (FC_CmdNumber n, (n', c)::history') -> 
+     if n = n' 
+     then Just (0,(n', c))
+     else incr_index (fc_find_matching_entry op history')
+  | (FC_Previous 0, (n,c)::_) -> Just (0, (n,c))
+  | (FC_Previous n, _::history') -> 
+     incr_index (fc_find_matching_entry (FC_Previous (n-1)) history')
+  | (FC_Matching s, (n, c)::history') ->
+     if fc_matches s c
+     then Just (0, (n, c))
+     else incr_index (fc_find_matching_entry op history')
+  end
+
+val fc_find_matching_index : fc_operand -> history -> maybe nat
+let fc_find_matching_index op history = Maybe.map fst (fc_find_matching_entry op history)
+
+let fc_editlist_commands opts ops history = 
+  (* "When commands are edited (when the -l option is not specified),
+     the resulting lines shall be entered at the end of the history
+     list and then re-executed by sh. The fc command that caused the
+     editing shall not be entered into the history list." *)
+  (* TODO 2019-07-10 yash prints out the fc command on fc -l; other shells don't *)
+  (* "When a range of commands is used, it shall not be an error to
+     specify first or last values that are not in the history list; fc
+     shall substitute the value representing the oldest or newest
+     command in the list, as appropriate." *)
+  (* TODO 2019-07-10 this may not _exactly_ right, since the range may
+     not have been specified by the user explicitly. what's the right behavior? 
+
+     fc -16 -1 is behaving funny in the current regime.
+   *)
+  let first_idx = Maybe.fromMaybe 0 (fc_find_matching_index ops.editlist_first history) in
+  let last_idx  = Maybe.fromMaybe (length history - 1) 
+                    (fc_find_matching_index ops.editlist_last history) in
+  (* If first represents a newer command than last, the commands shall
+     be listed or edited in reverse sequence. *)
+  let (drop_amt, take_amt, should_reverse) =
+    (* NB we don't subtract 1 from the drop amount to avoid listing the fc command itself *)
+    if last_idx < first_idx
+    then (last_idx, first_idx - last_idx + 1, true)
+    else (first_idx, last_idx - first_idx + 1, false)
+  in
+  let cmds = List.take take_amt (List.drop drop_amt history) in
+  (* cmds is in HISTORY order, i.e., recent to less recent, i.e., ALREADY reversed *)
+  if should_reverse || Set.member FC_Reverse opts
+  then cmds
+  else List.reverse cmds
+
+let fc_editlist_args s0 fc_opts fc_mode argv =
+  match fc_editlist_operands (fc_mode = FC_List) argv with
+  | Left err -> Left err
+  | Right ops -> 
+     let cmds = fc_editlist_commands fc_opts ops s0.sh.history in
+     if null cmds
+     then Left "history specification out of range"
+     else Right cmds
+  end
+
+let builtin_fc s0 argv _env = 
+  match fc_options_loop argv (fc_default_mode s0) Set.empty with
+  | Left err -> Left (s0, err)
+  | Right (argv', fc_mode, fc_opts) ->
+(*     let debug_args = 
+            ("fc " ^ spaced_many ([string_of_fc_mode fc_mode] ++
+                                  List.map string_of_fc_opt (Set_extra.toList fc_opts) ++
+                                  List.map string_of_symbolic_string argv') ^ "\n") in *)
+     let s1 = (* safe_write_stdout "fc" debug_args *) s0 in
+     (* we've parsed the flags and any --, but we still need to parse operands.
+        operands are mode dependent, though!
+      *)
+     match fc_mode with
+     | FC_NoEdit -> (* fc -s [old=new] [first] *)
+        match fc_noedit_operands argv' with
+        | Left err -> Left (s1, err)
+        | Right ops ->
+(*           let debug_ops = 
+             spaced 
+               (match ops.noedit_replace with
+                | Nothing -> "no replace"
+                | Just (s_old, s_new) -> s_old ^ "=" ^ string_of_symbolic_string s_new
+                end)
+               (string_of_fc_operand ops.noedit_first) ^ "\n"
+           in *)
+           let s2 = (* safe_write_stdout "fc" debug_ops *) s1 in
+           match fc_find_matching_entry ops.noedit_first s2.sh.history with
+           | Nothing -> Left (s2, "history specification out of range")
+           | Just (_idx,(_n,c)) ->
+              match ops.noedit_replace with
+              | Nothing -> 
+                 Right (add_to_history c s2, c) 
+              | Just (s_old, ss_new) -> 
+                 let (s3, _concretized, s_new) = concretize s2 ss_new in
+                 let s_orig = string_of_stmt c in
+                 let s_replaced = replace_string s_old s_new s_orig in
+                 (* TODO 2019-07-10 hide the eval in added history? 
+                    alternative solution: history holds strings, not parsed stmts
+                  *)
+                 let c = command_eval (symbolic_string_of_string s_replaced) in
+                 Right (add_to_history c s3, c)
+              end
+           end
+        end
+     | FC_List -> (* fc -l [-nr] [first [last]] *)
+        match fc_editlist_args s1 fc_opts fc_mode argv' with
+        | Left err -> Left (s1, err)
+        | Right cmds ->
+            let show_cmd (n,c) =
+              (if Set.member FC_NoNumber fc_opts then "" else stringFromNat n ^ "\t") ^
+                string_of_stmt c ^ "\n"
+            in
+            let s2 = safe_write_stdout "fc" (concat "" (List.map show_cmd cmds)) s1 in
+            Right (s2, Done)
+        end
+     | FC_Edit _editor -> (* fc [-r] [-e editor] [first [last]] *)
+        match fc_editlist_args s1 fc_opts fc_mode argv' with
+        | Left err -> Left (s1, err)
+        | Right _cmds -> Left (s1, "editor usage is unimplemented")
+        end
+     end
+  end
+
+(* TODO 2018-10-01 remaining worthwhile operations *)
+
+(* POSIX user control *)
+let builtin_ulimit = builtin_unimplemented (* XSI *)
+ 
+val builtins :
+  forall 'a. OS 'a =>
+    Map.map string 
+      (os_state 'a -> fields (* argv *) -> env -> 
+       either (os_state 'a * string) (os_state 'a * stmt))
+let builtins =
+  Map.fromList
+    [ ("[", builtin_bracket)
+    ; ("alias", builtin_alias)
+    ; ("bg", builtin_bg)
+    ; ("cd", builtin_cd)
+    ; ("command", builtin_command)
+    ; ("echo", builtin_echo)
+    ; ("false", builtin_false)    
+    ; ("fc", builtin_fc)
+    ; ("fg", builtin_fg)
+    ; ("getopts", builtin_getopts)
+    ; ("hash", builtin_hash)
+    ; ("help", builtin_help)
+    ; ("history", builtin_history)
+    ; ("jobs", builtin_jobs)
+    ; ("kill", builtin_kill)
+(*    ; ("newgrp", builtin_newgrp) *)
+    ; ("printf", builtin_printf)
+    ; ("pwd", builtin_pwd)
+    ; ("read", builtin_read)
+    ; ("test", builtin_test)
+    ; ("true", builtin_true)
+    ; ("type", builtin_type)
+    ; ("ulimit", builtin_ulimit)
+    ; ("umask", builtin_umask)
+    ; ("unalias", builtin_unalias)
+    ; ("wait", builtin_wait)
+    ]
+
+let run_command s0 opts checked prog_name argv env =
+  match try_concrete prog_name with
+  | Nothing -> Left (s0,"can't run symbolic command")
+  | Just prog ->
+     (* TODO 2018-09-06 if there's a slash, we can skip ahead. but shouldn't hurt. *)
+  (*  1a. If the command name matches the name of a special built-in utility, that special built-in utility shall be invoked. *)
+     match Map.lookup prog special_builtins with
+     | Just fn -> 
+        (* no need to mess with locals. the env has already been
+           added, because it's a special builtin! *)
+        fn s0 argv env
+     | Nothing ->
+        (* 1b. b. If the command name matches the name of a utility
+           listed in the following table, the results are unspecified. *)
+        let s1 = 
+          if is_unspecified_utility prog
+          then log_trace Trace_unspec (prog ^ "is unspecified") s0
+          else s0
+        in
+          (* 1c. If the command name matches the name of a function
+             known to this shell, the function shall be invoked as
+             described in Function Definition Command. If the
+             implementation has provided a standard utility in the
+             form of a function, it shall not be recognized at this
+             point. It shall be invoked in conjunction with the path
+             search in step 1e. *)
+          match (opts.force_simple_command, lookup_function prog s1) with
+          | (false, Just body) ->
+             let s2 = push_locals s1 env in
+             let s3 = set_function_params 0 argv s2 in
+             Right (s3,
+                    Call s1.sh.loop_nest (get_function_params s1) prog body body,
+                    true)
+          | _ -> 
+             (* 1d. If the command name matches the name [XSI] [Option
+                Start] of the type or ulimit utility, or [Option End]
+                of a utility listed in the following table, that
+                utility shall be invoked. *)
+             match Map.lookup prog builtins with
+             | Just fn -> 
+                let s2 = push_locals s1 env in
+                (* force a restore *)
+                match fn s2 argv env with
+                | Left (s2, err) -> 
+                   let (s3, _) = pop_locals s2 in
+                   Left (s3, err)
+                | Right (s2, stmt) -> 
+                   let restore = 
+                     match stmt with
+                     | CommandReady _env cmd [] [] _opts -> 
+                        (* special case for command exec w/o args *)
+                        cmd <> symbolic_string_of_string "exec"
+                     | _ -> true
+                     end
+                   in
+                   let (s3, _)  = pop_locals s2 in
+                   Right (s3, stmt, restore)
+                end
+             | Nothing ->
+                match check_execve Nothing (* no prefix *) s1 prog with
+                | (s2, Nothing) -> 
+                   (* failed... and emitted an error message and set the ec *)
+                   Right (s2, Done, true)
+                | (s2, Just executable) ->
+                   let cmd = symbolic_string_of_string executable in
+                   let exported = exported_set_vars s2 in
+                   (* use env to override exports---impl as Pmap.(union) *)
+                   let exec_env = Map.(union) exported env in
+                   let exec = Exec cmd prog_name argv exec_env TryBinSh in
+                   if opts.should_fork 
+                   then
+                     let (s3,pid) =
+                       fork_and_subshell s2 exec FG
+                         Nothing (* no existing process group *)
+                         true (* do job control *)
+                     in
+                     let stmt = CommandExpRedirs [] (prog_name::argv) ([], Nothing, []) default_cmd_opts in
+                     let (s4, _) = add_job s3 [(pid,stmt)] pid stmt FG JobRunning in
+                     Right (s4, Wait pid checked Nothing WaitInternal, true)
+                   else 
+                     (* ??? 2019-03-01 
+                        do we need to restore the redirs when we're execing anyway? *)
+                     Right (s2, exec, true)
+                end
+             end
+          end
+     end
+   end
+ 

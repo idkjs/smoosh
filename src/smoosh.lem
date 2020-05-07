@@ -1,0 +1,36 @@
+include import Smoosh_prelude
+include import Os
+
+val parse_init : parse_source -> maybe dash_string
+declare ocaml target_rep function parse_init = `Shim.parse_init`
+
+val stack_init : unit -> stackmark
+declare ocaml target_rep function stack_init = `Dash.init_stack`
+
+val stack_pop : stackmark -> unit
+declare ocaml target_rep function stack_pop = `Dash.pop_stack`
+
+val parse_done : maybe dash_string -> unit
+declare ocaml target_rep function parse_done = `Shim.parse_done`
+
+val parse_next_internal : interactivity_mode -> maybe stackmark -> parse_result
+declare ocaml target_rep function parse_next_internal = `Shim.parse_next`
+
+val parse_next : forall 'a. OS 'a => os_state 'a -> interactivity_mode -> maybe stackmark -> os_state 'a * parse_result
+let parse_next s0 interactive stackmark =
+  match parse_next_internal interactive stackmark with
+  | ParseDone   -> (s0,ParseDone)
+  | ParseError  -> (s0,ParseError)
+  | ParseNull   -> (s0,ParseNull)
+  | ParseStmt c ->
+     let s1 = 
+       if Set.member Sh_verbose s0.sh.opts
+       then safe_write_stderr (string_of_stmt c ^ "\n") s0
+       else s0
+     in
+     (s1, ParseStmt c)
+  end
+
+val parse_cleanup : maybe dash_string -> shell_level -> unit
+let parse_cleanup mss shell_level =
+  if is_toplevel shell_level then () else parse_done mss
