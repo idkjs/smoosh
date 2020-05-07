@@ -7,9 +7,12 @@ MLFILES=$(SRCFILES:.lem=.ml)
 LEMFILES=$(filter %.lem,$(SRCFILES))
 TESTFILES=test_prelude.ml test_arith.ml test_path.ml test_expansion.ml test_evaluation.ml
 
-.PHONY : all all.byte install test loc bump rebuild clean veryclean
+# .PHONY : all all.byte install test loc bump rebuild clean veryclean
+.PHONY : all all.byte install test loc 
 
-all : bump shtepper smoosh runtest
+
+# all : bump shtepper smoosh runtest
+all : shtepper smoosh runtest
 
 all.byte : smoosh.byte
 
