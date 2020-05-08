@@ -2,10 +2,7 @@
 
 Working local build of Smoosh Shell
 
-```sh
-ENV PATH="/home/opam/lem/bin:${PATH}"
-ENV LEMLIB="/home/opam/lem/library"
-```
+
 
 ## Lem [binary](./lem/INSTALL.md)
 
