@@ -1,4 +1,6 @@
-# Smoosh
+# [Smoosh](https://github.com/mgree/smoosh)
+
+Working local build of Smoosh Shell
 
 ```sh
 ENV PATH="/home/opam/lem/bin:${PATH}"
@@ -14,6 +16,7 @@ alternately pass the `-lib PATH_TO_LEM/library` flag to lem when you
 run it. Lem depends on [OCaml](http://caml.inria.fr/). Lem is tested against OCaml
 3.12.1. and 4.00.0. Other versions might or might not work.
 
+Temporary export of `lem/library`.
 ```sh
 ~/Github/smoosh/src master*
 ❯  export LEMLIB=$HOME/Github/smoosh/lem/library
@@ -26,3 +29,10 @@ run it. Lem depends on [OCaml](http://caml.inria.fr/). Lem is tested against OCa
 ❯ ./smoosh 
 $ 
  ```
+Export to `~/zshrc` for persistenc.
+
+`export LEMLIB=$HOME/Github/smoosh/lem/library >> ~/zshrc`
+
+# Shtepper WEB
+
+`cd web && sudo bundle install`

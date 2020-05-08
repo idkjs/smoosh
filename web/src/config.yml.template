@@ -1,0 +1,9 @@
+development:
+  shtepper_executable: /full/path/to/shtepper
+  submissions_tmpdir: /full/path/to/tmpdir
+test:
+  shtepper_executable: /full/path/to/shtepper
+  submissions_tmpdir: /full/path/to/tmpdir
+production:
+  shtepper_executable: /full/path/to/shtepper
+  submissions_tmpdir: /full/path/to/tmpdir

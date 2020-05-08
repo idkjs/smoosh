@@ -1,0 +1,60 @@
+.words {
+    background-color: silver;
+}
+
+span.expanded-word {
+    border: 1px dotted fuchsia;
+}
+
+span.field, span.tmp-field {
+    border: 1px solid red;
+}
+
+span.tmp-field {
+    border-style: dashed;
+}
+
+/* some mild shenanigans to get the spacing and copy-paste behavior right */
+span.field-separator, span.tmp-field-FS {
+    font-family: sans-serif;
+}
+
+span.field-separator::after, span.tmp-field-FS::after {
+    font-family: sans-serif;  
+    content: "␣ ";
+}
+
+pre.redir-Heredoc-text {
+    margin: 0px;
+}
+
+span.comment {
+    background-color: seashell;
+    margin-left: 2em;
+}
+
+span.comment::before {
+    content: "# ";
+}
+
+pre.stream {
+    color: chartreuse;
+    background-color: black;
+    font-family: monospace;
+}
+
+.stmt {
+    font-family: monospace;
+}
+
+div.env tr.local {
+    background-color: honeydew;
+}
+
+div.env tr.local td.val.unset {
+    background-color: seashell;
+}
+
+div.env tr.local td.val.unset::before {
+    content: "declared but unset";
+}
